@@ -1,0 +1,6 @@
+[submodule "external/Lilu"]
+	path = external/Lilu
+	url = https://github.com/acidanthera/Lilu.git
+[submodule "external/MacKernelSDK"]
+	path = external/MacKernelSDK
+	url = https://github.com/acidanthera/MacKernelSDK.git

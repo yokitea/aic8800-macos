@@ -1,0 +1,11 @@
+# Build outputs
+build/
+*.o
+*.d
+*.dSYM/
+
+# macOS Finder / editor artifacts
+.DS_Store
+._*
+*.swp
+*~

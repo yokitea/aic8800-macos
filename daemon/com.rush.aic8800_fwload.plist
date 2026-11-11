@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.rush.aic8800_fwload</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/PrivilegedHelperTools/aic8800_fwload</string>
+		<string>--daemon</string>
+		<string>--fw-dir</string>
+		<string>/Library/Application Support/AIC8800/fw/aic8800D80</string>
+		<string>--post-wake-delay-ms</string>
+		<string>1200</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/aic8800_fwload.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/aic8800_fwload.log</string>
+</dict>
+</plist>
+

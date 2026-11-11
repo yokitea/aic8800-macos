@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>AIC8800WiFi</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.rush.driver.AIC8800WiFi</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AIC8800WiFi</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>AIC8800D80_WiFi_If2</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.rush.driver.AIC8800WiFi</string>
+			<key>IOClass</key>
+			<string>AIC8800WiFi</string>
+			<key>IOProbeScore</key>
+			<integer>100000</integer>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>2</integer>
+			<key>idProduct</key>
+			<integer>36225</integer>
+			<key>idVendor</key>
+			<integer>13963</integer>
+		</dict>
+	</dict>
+	<key>OSBundleCompatibleVersion</key>
+	<string>0.1.0</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IONetworkingFamily</key>
+		<string>1.5.0</string>
+		<key>com.apple.iokit.IOUSBHostFamily</key>
+		<string>1.2</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>12.0.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>12.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>12.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>12.0.0</string>
+	</dict>
+	<key>OSBundleRequired</key>
+	<string>Network-Root</string>
+</dict>
+</plist>
