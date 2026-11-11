@@ -2,7 +2,7 @@
 
 macOS kernel extension and user-space firmware loader workspace for **AICSemi AIC8800D80** USB Wi-Fi 6 adapters.
 
-> **Project status:** **Phase 1 complete & empirically verified** (cold boot, S3 sleep/wake, hotplug replug, BSD Ethernet interface attachment, 0 kernel panics). Full 802.11 / data-path TX/RX and `IO80211Family` integration belong to subsequent phases.
+> **Project status:** **Phase 1 complete & empirically verified** (cold boot, S3 sleep/wake, hotplug replug, BSD Ethernet interface attachment, 0 kernel panics). **Phase 2 (Bluetooth 5.4 bring-up via AIC8800BTQuirk Lilu plugin)** implemented and verified in test suite. Full 802.11 / data-path TX/RX and `IO80211Family` integration belong to Phase 3.
 
 ## Hardware Stages
 
@@ -60,3 +60,4 @@ make test FW_DIR=/path/to/fw/aic8800D80 LINUX_FDRV=/path/to/aic8800_fdrv
    ```sh
    sudo make uninstall-daemon
    ```
+

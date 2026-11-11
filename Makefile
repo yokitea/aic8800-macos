@@ -35,6 +35,7 @@ FWLOAD    := $(BUILD_DIR)/aic8800_fwload
 TEST_ABI    := $(BUILD_DIR)/test_abi_parity
 TEST_PHASE0 := $(BUILD_DIR)/test_phase0
 TEST_PHASE1 := $(BUILD_DIR)/test_phase1
+TEST_PHASE2 := $(BUILD_DIR)/test_phase2_bt
 TEST_NOHEAP := $(BUILD_DIR)/test_hotpath_noheap
 TEST_DAEMON := $(BUILD_DIR)/test_fwload_daemon
 
@@ -113,6 +114,11 @@ $(TEST_PHASE1): tests/test_phase1.cpp common/aic8800_abi.h common/aic8800_framin
 		-Wall -Wextra -Werror -Icommon \
 		$< -o $@
 
+$(TEST_PHASE2): tests/test_phase2_bt.cpp common/aic8800_abi.h | $(BUILD_DIR)
+	$(CXX) -std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all \
+		-Wall -Wextra -Werror -Icommon \
+		$< -o $@
+
 $(TEST_NOHEAP): tests/test_hotpath_noheap.c common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -Icommon $< -o $@
 
@@ -120,13 +126,15 @@ $(TEST_DAEMON): tests/test_fwload_daemon.c common/aic8800_abi.h common/aic8800_f
 	$(CC) -std=c11 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all \
 		-Wall -Wextra -Werror -Icommon $< -o $@
 
-test: all $(TEST_ABI) $(TEST_PHASE0) $(TEST_PHASE1) $(TEST_NOHEAP) $(TEST_DAEMON)
+test: all $(TEST_ABI) $(TEST_PHASE0) $(TEST_PHASE1) $(TEST_PHASE2) $(TEST_NOHEAP) $(TEST_DAEMON)
 	@echo "--- Running ABI compile-time parity check ---"
 	./$(TEST_ABI)
 	@echo "--- Running ASan + UBSan 10k+ Phase 0 vector suite ---"
 	./$(TEST_PHASE0)
 	@echo "--- Running ASan + UBSan Phase 1 LMAC & TX/RX flow suite ---"
 	./$(TEST_PHASE1)
+	@echo "--- Running ASan + UBSan Phase 2 Bluetooth quirk suite ---"
+	./$(TEST_PHASE2)
 	@echo "--- Running zero-heap C interpose hot-path trap ---"
 	./$(TEST_NOHEAP)
 	@echo "--- Running ASan + UBSan fwload daemon control-plane suite ---"

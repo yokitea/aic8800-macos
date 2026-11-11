@@ -40,6 +40,13 @@
 #define AIC_USB_PID_BOOTLOADER      0x8D80U /* Stage 1 Bootloader (VID 0xA69C) */
 #define AIC_USB_PID_WIFI_BT_RUNTIME 0x8D81U /* Stage 2 Composite Wi-Fi+BT (VID 0x368B) */
 
+/* Bluetooth USB Quirk & Spoof Constants (macOS bluetoothd matching) */
+#define AIC_USB_VID_CSR_SPOOF       0x0A12U /* CSR Bluetooth VID accepted by macOS bluetoothd */
+#define AIC_USB_VID_ASUS_SPOOF      0x0B05U /* ASUS Bluetooth VID accepted by macOS bluetoothd */
+#define AIC_USB_PID_ASUS_BT500      0x190EU /* ASUS USB-BT500 PID */
+#define AIC_USB_BT_EP_ACL_OUT       0x04U   /* Bluetooth ACL Bulk OUT Endpoint on Interface 0 */
+#define AIC_USB_BT_ACL_ZLP_CHUNK    512U   /* High-Speed Bulk OUT MaxPacketSize triggering ZLP */
+
 /* USB Mass Storage Bulk-Only Transport (BOT) Eject CBW constants */
 #define AIC_USB_BOT_CBW_LEN         31U
 #define AIC_USB_BOT_CSW_LEN         13U

@@ -204,7 +204,7 @@ static int pt_table_parse(const uint8_t *raw,
     return 0;
 }
 
-static bool usb_vid_pid_present(uint16_t vid, uint16_t pid) {
+static bool usb_vid_pid_present_exact(uint16_t vid, uint16_t pid) {
     CFMutableDictionaryRef match = IOServiceMatching(kIOUSBDeviceClassName);
     if (!match) {
         return false;
@@ -222,6 +222,16 @@ static bool usb_vid_pid_present(uint16_t vid, uint16_t pid) {
     if (svc != IO_OBJECT_NULL) {
         IOObjectRelease(svc);
         return true;
+    }
+    return false;
+}
+
+static bool usb_vid_pid_present(uint16_t vid, uint16_t pid) {
+    if (usb_vid_pid_present_exact(vid, pid)) {
+        return true;
+    }
+    if (vid == AIC_USB_VID_AICS_WIFI && pid == AIC_USB_PID_WIFI_BT_RUNTIME) {
+        return usb_vid_pid_present_exact(AIC_USB_VID_CSR_SPOOF, pid);
     }
     return false;
 }
