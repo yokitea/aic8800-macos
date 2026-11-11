@@ -2,6 +2,7 @@
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
+#include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <pexpert/pexpert.h>
 
@@ -17,7 +18,7 @@ static KernelPatcher::KextInfo kWatchedKexts[] = {
         "com.apple.iokit.IOUSBHostFamily",
         kIOUSBHostFamilyPath,
         arrsize(kIOUSBHostFamilyPath),
-        {},
+        {true}, /* sys[KernelPatcher::KextInfo::Loaded] = true: hook prelinked KC kext */
         {},
         KernelPatcher::KextInfo::Unloaded
     },
@@ -72,20 +73,61 @@ mach_vm_address_t AIC8800BTQuirkModule::orgInternalDeviceRequest = 0;
 mach_vm_address_t AIC8800BTQuirkModule::orgSyncIO = 0;
 mach_vm_address_t AIC8800BTQuirkModule::orgAsyncIO = 0;
 
+void AIC8800BTQuirkModule::spoofExistingDevices() {
+    const char *targetClasses[] = {"IOUSBHostDevice", "AppleUSBDevice"};
+    for (size_t c = 0; c < 2; c++) {
+        OSDictionary *dict = IOService::serviceMatching(targetClasses[c]);
+        if (!dict) continue;
+
+        OSIterator *iter = IOService::getMatchingServices(dict);
+        dict->release();
+        if (!iter) continue;
+
+        while (auto *entry = OSDynamicCast(IORegistryEntry, iter->getNextObject())) {
+            OSNumber *nP = OSDynamicCast(OSNumber, entry->getProperty("idProduct"));
+            if (nP && nP->unsigned16BitValue() == AIC_USB_PID_WIFI_BT_RUNTIME) {
+                OSNumber *nV = OSDynamicCast(OSNumber, entry->getProperty("idVendor"));
+                uint16_t oldVid = nV ? nV->unsigned16BitValue() : 0;
+                entry->setProperty("idVendor", static_cast<unsigned long long>(AIC_USB_VID_CSR_SPOOF), 32);
+                entry->setProperty("USB Vendor Name", "CSR");
+                entry->setProperty("AIC-BT-Quirk-Active", kOSBooleanTrue);
+                IOLog("AIC8800BTQuirk: Retrospectively spoofed %s (0x%04x:0x%04x) -> idVendor=0x%04x (CSR)\n",
+                      targetClasses[c], oldVid, AIC_USB_PID_WIFI_BT_RUNTIME, AIC_USB_VID_CSR_SPOOF);
+
+                OSIterator *childIter = entry->getChildIterator(gIOServicePlane);
+                if (childIter) {
+                    while (auto *child = OSDynamicCast(IORegistryEntry, childIter->getNextObject())) {
+                        child->setProperty("idVendor", static_cast<unsigned long long>(AIC_USB_VID_CSR_SPOOF), 32);
+                        child->setProperty("USB Vendor Name", "CSR");
+                        child->setProperty("AIC-BT-Quirk-Active", kOSBooleanTrue);
+                        IOLog("AIC8800BTQuirk: Spoofed child interface %s -> idVendor=0x%04x (CSR)\n",
+                              child->getName(), AIC_USB_VID_CSR_SPOOF);
+                    }
+                    childIter->release();
+                }
+            }
+        }
+        iter->release();
+    }
+}
+
 bool AIC8800BTQuirkModule::init() {
     uint32_t offFlag = 0;
     if (PE_parse_boot_argn("aic_off", &offFlag, sizeof(offFlag)) && offFlag != 0) {
-        SYSLOG("aicbt", "disabled by aic_off=1 boot-arg");
+        IOLog("AIC8800BTQuirk: disabled by aic_off=1 boot-arg\n");
         return false;
     }
     if (PE_parse_boot_argn("aic_btoff", &offFlag, sizeof(offFlag)) && offFlag != 0) {
-        SYSLOG("aicbt", "disabled by aic_btoff=1 boot-arg");
+        IOLog("AIC8800BTQuirk: disabled by aic_btoff=1 boot-arg\n");
         return false;
     }
 
     if (!gZlpLock) {
         gZlpLock = IOSimpleLockAlloc();
     }
+
+    /* Force Lilu to hook already-loaded IOUSBHostFamily in Prelinked Kernel Collection */
+    kWatchedKexts[0].sys[KernelPatcher::KextInfo::Loaded] = true;
 
     lilu.onKextLoadForce(
         kWatchedKexts,
@@ -98,8 +140,11 @@ bool AIC8800BTQuirkModule::init() {
         },
         this);
 
-    SYSLOG("aicbt", "AIC8800BTQuirk initialized (CSR spoof 0x%04x, ZLP threshold %uB)",
-           AIC_USB_VID_CSR_SPOOF, AIC_USB_BT_ACL_ZLP_CHUNK);
+    /* Also immediately scan and spoof if device already attached */
+    spoofExistingDevices();
+
+    IOLog("AIC8800BTQuirk: initialized (CSR spoof 0x%04x, ZLP threshold %uB)\n",
+          AIC_USB_VID_CSR_SPOOF, AIC_USB_BT_ACL_ZLP_CHUNK);
     return true;
 }
 
@@ -139,8 +184,8 @@ bool AIC8800BTQuirkModule::hookedStart(IOUSBHostDevice *that, IOService *provide
         that->setProperty("idVendor", static_cast<unsigned long long>(AIC_USB_VID_CSR_SPOOF), 32);
         that->setProperty("USB Vendor Name", "CSR");
         that->setProperty("AIC-BT-Quirk-Active", kOSBooleanTrue);
-        SYSLOG("aicbt", "AIC8800 Stage 2 USB device (0x%04x:0x%04x) attached; set idVendor=0x%04x (CSR) for bluetoothd",
-               vid, pid, AIC_USB_VID_CSR_SPOOF);
+        IOLog("AIC8800BTQuirk: hookedStart for (0x%04x:0x%04x) -> set idVendor=0x%04x (CSR) for bluetoothd\n",
+              vid, pid, AIC_USB_VID_CSR_SPOOF);
     }
 
     return ok;
@@ -165,8 +210,8 @@ IOReturn AIC8800BTQuirkModule::hookedInternalDeviceRequest(IOUSBHostDevice *that
 
         if (isAIC) {
             /* Quirk: bmRequestType = 0x21 (Class, Interface) stalls EP0 on AIC8800.
-             * Rewrite to 0x20 (Class, Device) if targeting control endpoint (wIndex == 0). */
-            if (request.bmRequestType == 0x21 && request.wIndex == 0) {
+             * Rewrite to 0x20 (Class, Device) if targeting control endpoint / interface 0. */
+            if (request.bmRequestType == 0x21 && (request.wIndex & 0xFF) == 0) {
                 request.bmRequestType = 0x20;
             }
         }
@@ -266,10 +311,13 @@ void AIC8800BTQuirkModule::processKext(KernelPatcher &patcher,
     };
 
     if (patcher.routeMultiple(index, requests, address, size)) {
-        SYSLOG("aicbt", "successfully patched IOUSBHostFamily (start + internalDeviceRequest + sync/async io)");
+        IOLog("AIC8800BTQuirk: successfully patched IOUSBHostFamily (start + internalDeviceRequest + sync/async io)\n");
     } else {
-        SYSLOG("aicbt", "warning: routeMultiple on IOUSBHostFamily encountered errors (code=%d)",
-               patcher.getError());
+        IOLog("AIC8800BTQuirk: warning: routeMultiple on IOUSBHostFamily encountered errors (code=%d)\n",
+              patcher.getError());
         patcher.clearError();
     }
+
+    /* Retrospectively spoof any existing devices */
+    spoofExistingDevices();
 }

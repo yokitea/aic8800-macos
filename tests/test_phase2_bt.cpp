@@ -13,7 +13,7 @@ inline uint8_t quirk_rewrite_bm_request_type(bool is_aic_device,
                                              uint8_t bmRequestType,
                                              uint16_t wIndex) {
     if (is_aic_device) {
-        if (bmRequestType == 0x21U && wIndex == 0U) {
+        if (bmRequestType == 0x21U && (wIndex & 0xFFU) == 0U) {
             return 0x20U;
         }
     }

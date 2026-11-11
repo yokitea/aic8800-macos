@@ -35,6 +35,9 @@ public:
                                  IOUSBHostCompletion *completion,
                                  uint32_t completionTimeoutMs);
 
+    /* Retrospectively scan and spoof existing devices */
+    static void spoofExistingDevices();
+
     /* Trampoline storage */
     static mach_vm_address_t orgStart;
     static mach_vm_address_t orgInternalDeviceRequest;
