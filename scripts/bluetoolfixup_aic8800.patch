@@ -1,0 +1,62 @@
+diff --git a/BrcmPatchRAM/BlueToolFixup.cpp b/BrcmPatchRAM/BlueToolFixup.cpp
+index e592e66..f362b86 100644
+--- a/BrcmPatchRAM/BlueToolFixup.cpp
++++ b/BrcmPatchRAM/BlueToolFixup.cpp
+@@ -161,6 +161,44 @@ static const uint8_t kBadChipsetCheckPatched15_4[] =
+     0x90, 0x90
+ };
+ 
++// Workaround for non-Broadcom USB Bluetooth controllers (AIC8800, Realtek, MediaTek):
++// Apple hardcoded bmRequestType = 0x21 (Class | Interface) for HCI command transfers
++// instead of standard Bluetooth Core Spec Vol 4 Part B Section 2.1 (0x20, Class | Device).
++// This causes AIC8800 boot ROM to return kIOUSBPipeStalled (0xe000404f), resulting in
++// HCI_Reset opcode 0x0C03 timeout (STATUS 621).
++static const uint8_t kHCIbmRequestTypeOriginal[] =
++{
++    0xC6, 0x06, 0x21,             // mov byte [rsi], 0x21
++    0x41, 0x0F, 0xB7, 0x46, 0x18, // movzx eax, word [r14+0x18]
++    0x66, 0x89, 0x46, 0x06        // mov [rsi+0x6], ax
++};
++
++static const uint8_t kHCIbmRequestTypePatched[] =
++{
++    0xC6, 0x06, 0x20,             // mov byte [rsi], 0x20
++    0x41, 0x0F, 0xB7, 0x46, 0x18, // movzx eax, word [r14+0x18]
++    0x66, 0x89, 0x46, 0x06        // mov [rsi+0x6], ax
++};
++
++// Workaround for bluetoothExternalDongleFailed lock-out:
++// If a dongle ever timed out or failed previously, bluetoothd sets
++// bluetoothExternalDongleFailed = 01 in NVRAM and refuses to attempt
++// external initialization, falling back to internal controller loop.
++// We force bl = 1 so it always attempts external dongle initialization.
++static const uint8_t kSkipExternalFailedCheckOriginal[] =
++{
++    0x80, 0x38, 0x01,       // cmp byte [rax], 1
++    0x0F, 0x95, 0xC3,       // setnz bl
++    0xEB, 0x2C              // jmp short
++};
++
++static const uint8_t kSkipExternalFailedCheckPatched[] =
++{
++    0x80, 0x38, 0x01,       // cmp byte [rax], 1
++    0xB3, 0x01, 0x90,       // mov bl, 1; nop
++    0xEB, 0x2C              // jmp short
++};
++
+ static bool shouldPatchBoardId = false;
+ static bool shouldPatchAddress = false;
+ static bool shouldPatchNvramCheck = false;
+@@ -236,6 +274,12 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
+                 searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+             if (shouldPatchAddress)
+                 searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
++            if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kHCIbmRequestTypeOriginal, sizeof(kHCIbmRequestTypeOriginal), kHCIbmRequestTypePatched, sizeof(kHCIbmRequestTypePatched))) {
++                SYSLOG(MODULE_SHORT, "Patched HCI command bmRequestType 0x21 -> 0x20 in %s!", path);
++            }
++            if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kSkipExternalFailedCheckOriginal, sizeof(kSkipExternalFailedCheckOriginal), kSkipExternalFailedCheckPatched, sizeof(kSkipExternalFailedCheckPatched))) {
++                SYSLOG(MODULE_SHORT, "Patched external dongle failed check (forced active) in %s!", path);
++            }
+         }
+     }
+ }
