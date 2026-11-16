@@ -6,7 +6,8 @@ macOS kernel extensions, user-space firmware loader, WPA2-PSK supplicant daemon,
   <img src="docs/aic8800d80-ax928b-dongle.jpg" alt="AX928B AX900 AIC8800D80 Wi-Fi 6 + Bluetooth 5.4 USB Adapter" width="560" />
 </p>
 
-> **Status (verified live booting directly from Internal SATA EFI on macOS Sequoia 15.8.2):**
+> **Status (verified live booting directly from Internal SATA EFI on macOS Sequoia 15.8.2 & 15.8.3):**
+> - **Verified on macOS 15.8.3 (24H241)** (Wi-Fi 6 A-MPDU, `AIC8800Menu.app`, `netstat` counters, and Bluetooth 5.4 via `BlueToolFixup` 4-patch).
 > - **Stage 0 -> 1 -> 2 Bring-Up**: Cold boot, S3 sleep/wake recovery, and hotplug replug via `AIC8800MSCBlocker.kext` + `aic8800_fwload`.
 > - **Wi-Fi 6 Data Path**: Dual-band (2.4 GHz & 5 GHz), TX/RX A-MPDU aggregation with zero-heap `8 TID x 64-slot` BlockAck reordering, WPA2-PSK 4-Way Handshake + GTK rekey + Open networks, auto-DHCP, and accurate BSD `netstat -I enX -b` counters (`Ipkts`/`Ibytes`/`Opkts`/`Obytes`).
 > - **Menu Bar UI (`AIC8800Menu.app`)**: Lightweight `LSUIElement` Swift/AppKit menu bar app talking to `aic8800_wifi --daemon` over `/var/run/aic8800_wifi.sock` (`root:admin 0660`) with no daily `sudo` prompts.
@@ -80,7 +81,7 @@ sudo aic8800_wifi disconnect
 
 - Presented as a pure public-KPI `IOEthernetController` (`enX`), not Apple's private `IO80211Family`, so SSID selection uses `AIC8800Menu.app` or `aic8800_wifi` rather than macOS System Settings -> Wi-Fi.
 - Supplicant supports **WPA2-PSK** and **Open** networks (WPA3-SAE and 802.1X Enterprise are not yet implemented).
-- Built and verified on **macOS Sequoia 15.8.2 (`x86_64`)**; untested on Apple Silicon.
+- Built and verified on **macOS Sequoia 15.8.2 & 15.8.3 (`24H241`, `x86_64`)**; untested on Apple Silicon.
 
 ## Uninstall
 
