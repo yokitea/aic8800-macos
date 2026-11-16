@@ -87,3 +87,10 @@ sudo aic8800_wifi disconnect
 ```sh
 sudo ./scripts/uninstall_daemon.sh
 ```
+
+## License
+
+Licensed under the [BSD 3-Clause License](LICENSE).
+
+- `external/Lilu` and `external/MacKernelSDK` submodules remain under their respective Acidanthera BSD 3-Clause licenses.
+- External AICSemi firmware binaries (`fw/aic8800D80/*.bin`) are vendor proprietary assets and are not included in this repository.
