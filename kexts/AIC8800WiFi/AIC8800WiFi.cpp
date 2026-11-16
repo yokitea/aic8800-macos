@@ -38,6 +38,13 @@ bool AIC8800WiFi::init(OSDictionary *properties) {
 }
 
 void AIC8800WiFi::free() {
+    if (reordTimer_) {
+        reordTimer_->cancelTimeout();
+        if (workLoop_) {
+            workLoop_->removeEventSource(reordTimer_);
+        }
+        OSSafeReleaseNULL(reordTimer_);
+    }
     if (linkSyncTimer_) {
         linkSyncTimer_->cancelTimeout();
         if (workLoop_) {
@@ -444,16 +451,18 @@ void AIC8800WiFi::handleAsyncLmacEvent(uint16_t msgId, const uint8_t *param, uin
         IOLockLock(stateLock_);
         assocStatus_ = ind.status_code;
         if (ind.status_code == 0U) {
-            associated_   = true;
-            apStaIdx_     = ind.ap_idx;
-            apQos_        = ind.qos;
-            apBand_       = ind.band;
-            apWidth_      = ind.width;
-            apCenterFreq_ = ind.center_freq;
-            disconnectReason_ = 0U;
+            associated_        = true;
+            apStaIdx_          = ind.ap_idx;
+            apQos_             = ind.qos;
+            apBand_            = ind.band;
+            apWidth_           = ind.width;
+            apCenterFreq_      = ind.center_freq;
+            disconnectReason_  = 0U;
+            pendingReordReset_ = true;
             memcpy(apBssid_, ind.bssid.array, AIC_MAC_ADDR_LEN);
         } else {
-            associated_ = false;
+            associated_        = false;
+            pendingReordReset_ = true;
             if (linkUp_) {
                 linkUp_ = false;
                 needLinkDrop = true;
@@ -467,7 +476,7 @@ void AIC8800WiFi::handleAsyncLmacEvent(uint16_t msgId, const uint8_t *param, uin
               ind.bssid.array[1] & 0xFFU, (ind.bssid.array[1] >> 8U) & 0xFFU,
               ind.bssid.array[2] & 0xFFU, (ind.bssid.array[2] >> 8U) & 0xFFU);
 
-        if (needLinkDrop && linkSyncTimer_) {
+        if ((needLinkDrop || pendingReordReset_) && linkSyncTimer_) {
             (void)linkSyncTimer_->setTimeoutMS(1U);
         }
         return;
@@ -480,23 +489,20 @@ void AIC8800WiFi::handleAsyncLmacEvent(uint16_t msgId, const uint8_t *param, uin
         aic_sm_disconnect_ind_t ind;
         memcpy(&ind, param, sizeof(ind));
 
-        bool needLinkDrop = false;
         IOLockLock(stateLock_);
-        associated_       = false;
-        disconnectReason_ = ind.reason_code;
-        if (linkUp_) {
-            linkUp_ = false;
-            needLinkDrop = true;
-        }
-        eapolHead_  = 0U;
-        eapolTail_  = 0U;
-        eapolCount_ = 0U;
+        associated_        = false;
+        disconnectReason_  = ind.reason_code;
+        linkUp_            = false;
+        pendingReordReset_ = true;
+        eapolHead_         = 0U;
+        eapolTail_         = 0U;
+        eapolCount_        = 0U;
         IOLockUnlock(stateLock_);
 
         IOLog("AIC8800WiFi: SM_DISCONNECT_IND reason=%u vif=%u\n",
               ind.reason_code, ind.vif_idx);
 
-        if (needLinkDrop && linkSyncTimer_) {
+        if (linkSyncTimer_) {
             (void)linkSyncTimer_->setTimeoutMS(1U);
         }
     }
@@ -548,6 +554,61 @@ void AIC8800WiFi::handleMsgRxBuffer(const uint8_t *buf, uint32_t bytesTransferre
     }
 }
 
+void AIC8800WiFi::reordDeliverFn(void *headPkt, uint32_t totalBytes, void *ctx) {
+    (void)totalBytes;
+    AIC8800WiFi *self = static_cast<AIC8800WiFi *>(ctx);
+    mbuf_t cur = static_cast<mbuf_t>(headPkt);
+    while (cur != nullptr) {
+        mbuf_t next = mbuf_nextpkt(cur);
+        mbuf_setnextpkt(cur, nullptr);
+        if (self && self->netIf_ && self->isEnabled_ && self->linkUp_ && !self->stopping_) {
+            const UInt32 pktLen = static_cast<UInt32>(mbuf_pkthdr_len(cur));
+            (void)self->netIf_->inputPacket(cur, pktLen, 0U, nullptr);
+            if (self->netStats_) {
+                OSIncrementAtomic(&self->netStats_->inputPackets);
+            }
+        } else if (self) {
+            self->freePacket(cur);
+        }
+        cur = next;
+    }
+}
+
+void AIC8800WiFi::reordAppendFn(void *tailPkt, void *newPkt) {
+    mbuf_t tail = static_cast<mbuf_t>(tailPkt);
+    mbuf_t next = static_cast<mbuf_t>(newPkt);
+    if (tail) {
+        mbuf_setnextpkt(tail, next);
+    }
+    if (next) {
+        mbuf_setnextpkt(next, nullptr);
+    }
+}
+
+void AIC8800WiFi::reordDropFn(void *headPkt, void *ctx) {
+    AIC8800WiFi *self = static_cast<AIC8800WiFi *>(ctx);
+    mbuf_t cur = static_cast<mbuf_t>(headPkt);
+    while (cur != nullptr) {
+        mbuf_t next = mbuf_nextpkt(cur);
+        mbuf_setnextpkt(cur, nullptr);
+        if (self) {
+            self->freePacket(cur);
+        }
+        cur = next;
+    }
+}
+
+void AIC8800WiFi::resetReordWindow() {
+    if (reordTimer_) {
+        reordTimer_->cancelTimeout();
+    }
+    if (rxDeliverLock_) {
+        IOLockLock(rxDeliverLock_);
+        aic_rx_reord_flush_all(&reord_, true, &AIC8800WiFi::reordDeliverFn, &AIC8800WiFi::reordDropFn, this);
+        IOLockUnlock(rxDeliverLock_);
+    }
+}
+
 void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferred) {
     if (!buf || bytesTransferred < 4U) {
         return;
@@ -555,7 +616,6 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
 
     struct DataRxCtx {
         AIC8800WiFi *self;
-        bool         queuedPackets;
     };
 
     struct DataRxHelper {
@@ -593,14 +653,34 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
                 }
                 return;
             }
+            mbuf_setnextpkt(pkt, nullptr);
 
-            (void)self->netIf_->inputPacket(pkt,
-                                            static_cast<UInt32>(eth_len),
-                                            IONetworkInterface::kInputOptionQueuePacket,
-                                            nullptr);
-            rxCtx->queuedPackets = true;
-            if (self->netStats_) {
-                OSIncrementAtomic(&self->netStats_->inputPackets);
+            if (meta && meta->is_qos && meta->need_reord) {
+                bool needsTimer = false;
+                aic_rx_reord_submit(&self->reord_,
+                                    meta->tid,
+                                    meta->seq_num,
+                                    pkt,
+                                    static_cast<uint32_t>(eth_len),
+                                    meta->amsdu_sub_idx > 0U,
+                                    &AIC8800WiFi::reordDeliverFn,
+                                    &AIC8800WiFi::reordAppendFn,
+                                    &AIC8800WiFi::reordDropFn,
+                                    self,
+                                    &needsTimer);
+                if (needsTimer && self->reordTimer_) {
+                    (void)self->reordTimer_->setTimeoutMS(AIC_REORD_TIMEOUT_MS);
+                }
+            } else {
+                if (meta && meta->is_qos) {
+                    aic_rx_reord_flush_tid(&self->reord_,
+                                           meta->tid,
+                                           false,
+                                           &AIC8800WiFi::reordDeliverFn,
+                                           &AIC8800WiFi::reordDropFn,
+                                           self);
+                }
+                AIC8800WiFi::reordDeliverFn(pkt, static_cast<uint32_t>(eth_len), self);
             }
         }
 
@@ -649,16 +729,12 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
         }
     };
 
-    DataRxCtx rxCtx = { this, false };
+    DataRxCtx rxCtx = { this };
     (void)aic_rx_demux_usb_aggr(buf,
                                 bytesTransferred,
                                 &DataRxHelper::onDataChunk,
                                 &DataRxHelper::onCfgPkt,
                                 &rxCtx);
-
-    if (rxCtx.queuedPackets && netIf_) {
-        (void)netIf_->flushInputQueue();
-    }
 }
 
 void AIC8800WiFi::onRxComplete(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred) {
@@ -1038,16 +1114,16 @@ bool AIC8800WiFi::bringUpLmac() {
     }
     vifIdx_ = addIfCfm.inst_nbr;
 
-    /* 14. Disable A-MPDU aggregation initially for Stage 2 baseline */
+    /* 14. Enable TX & RX A-MPDU aggregation (handled by zero-heap reorder window) */
     aic_mm_set_agg_disable_req_t aggReq = {};
-    aic_build_d80_agg_disable_req(&aggReq);
+    aic_build_d80_agg_enable_req(&aggReq);
     cfmLen = 0U;
     ret = sendLmacCmd(AIC_MM_SET_AGG_DISABLE_REQ, AIC_TASK_MM, AIC_DRV_TASK_ID,
                       &aggReq, sizeof(aggReq),
                       AIC_MM_SET_AGG_DISABLE_CFM,
                       nullptr, 0U, &cfmLen, AIC_CMD_TX_TIMEOUT_MS);
     if (ret != kIOReturnSuccess) {
-        IOLog("AIC8800WiFi: MM_SET_AGG_DISABLE_REQ failed ret=0x%x\n", ret);
+        IOLog("AIC8800WiFi: MM_SET_AGG_DISABLE_REQ(enable) failed ret=0x%x\n", ret);
         return false;
     }
 
@@ -1124,13 +1200,15 @@ bool AIC8800WiFi::start(IOService *provider) {
         return false;
     }
 
-    stopping_        = false;
-    isEnabled_       = false;
-    lmacReady_       = false;
-    inFlightIoCount_ = 0;
+    stopping_          = false;
+    isEnabled_         = false;
+    lmacReady_         = false;
+    pendingReordReset_ = false;
+    inFlightIoCount_   = 0;
     (void)aic_slot_pool_init(&txPool_, kTxRingSlots);
     aic_tx_flow_ctrl_init(&txFlowCtrl_, kTxRingSlots, kTxLowWater, kTxHighWater);
     aic_lmac_cmd_matcher_init(&cmdMatcher_);
+    aic_rx_reord_init(&reord_);
 
     if (!discoverBulkPipes()) {
         IOLog("AIC8800WiFi: 4 bulk IN/OUT endpoints missing on interface %u\n",
@@ -1207,12 +1285,18 @@ bool AIC8800WiFi::start(IOService *provider) {
             (void)workLoop_->addEventSource(linkSyncTimer_);
         }
     }
+    if (!reordTimer_ && workLoop_) {
+        reordTimer_ = IOTimerEventSource::timerEventSource(this, &AIC8800WiFi::onReordTimer);
+        if (reordTimer_) {
+            (void)workLoop_->addEventSource(reordTimer_);
+        }
+    }
 
-    /* Phase 3A: keep kIONetworkLinkActive OFF until LMAC association + keys ready */
+    /* Phase 3B: keep kIONetworkLinkActive OFF until LMAC association + keys ready */
     setLinkStatus(kIONetworkLinkValid);
     netIf_->registerService();
     registerService();
-    IOLog("AIC8800WiFi: started Phase 3A (in=0x%02x msgIn=0x%02x out=0x%02x msgOut=0x%02x mps=%u/%u)\n",
+    IOLog("AIC8800WiFi: started Phase 3B (A-MPDU + RX BA reorder enabled, in=0x%02x msgIn=0x%02x out=0x%02x msgOut=0x%02x mps=%u/%u)\n",
           epInAddr_, epInMsgAddr_, epOutDataAddr_, epOutMsgAddr_,
           maxPacketSizeOut_, maxPacketSizeOutMsg_);
     return true;
@@ -1280,7 +1364,15 @@ void AIC8800WiFi::stop(IOService *provider) {
     }
 
     stopAndDrainIo();
+    resetReordWindow();
 
+    if (reordTimer_) {
+        reordTimer_->cancelTimeout();
+        if (workLoop_) {
+            workLoop_->removeEventSource(reordTimer_);
+        }
+        OSSafeReleaseNULL(reordTimer_);
+    }
     if (linkSyncTimer_) {
         linkSyncTimer_->cancelTimeout();
         if (workLoop_) {
@@ -1522,7 +1614,26 @@ void AIC8800WiFi::onLinkSyncTimer(OSObject *owner, IOTimerEventSource *sender) {
     (void)sender;
     AIC8800WiFi *self = OSDynamicCast(AIC8800WiFi, owner);
     if (self && !self->stopping_ && !self->isInactive()) {
+        if (self->pendingReordReset_) {
+            self->pendingReordReset_ = false;
+            self->resetReordWindow();
+        }
         self->applyCurrentLinkStatus();
+    }
+}
+
+void AIC8800WiFi::onReordTimer(OSObject *owner, IOTimerEventSource *sender) {
+    (void)sender;
+    AIC8800WiFi *self = OSDynamicCast(AIC8800WiFi, owner);
+    if (!self || self->stopping_ || self->isInactive() || !self->rxDeliverLock_) {
+        return;
+    }
+    bool needRearm = false;
+    IOLockLock(self->rxDeliverLock_);
+    needRearm = aic_rx_reord_timeout_flush(&self->reord_, &AIC8800WiFi::reordDeliverFn, self);
+    IOLockUnlock(self->rxDeliverLock_);
+    if (needRearm && self->reordTimer_ && !self->stopping_) {
+        (void)self->reordTimer_->setTimeoutMS(AIC_REORD_TIMEOUT_MS);
     }
 }
 
@@ -1533,6 +1644,10 @@ IOReturn AIC8800WiFi::onWorkLoopSyncLink(OSObject *owner, void *arg0, void *arg1
     (void)arg3;
     AIC8800WiFi *self = OSDynamicCast(AIC8800WiFi, owner);
     if (self && !self->stopping_ && !self->isInactive()) {
+        if (self->pendingReordReset_) {
+            self->pendingReordReset_ = false;
+            self->resetReordWindow();
+        }
         self->applyCurrentLinkStatus();
     }
     return kIOReturnSuccess;
@@ -1764,9 +1879,10 @@ IOReturn AIC8800WiFi::ctlConnect(const aic_wifi_connect_req_t *inReq, aic_wifi_c
     outResp->out_status = 0xFFU;
 
     IOLockLock(stateLock_);
-    associated_       = false;
-    linkUp_           = false;
-    assocStatus_      = 0xFFFFU;
+    associated_        = false;
+    linkUp_            = false;
+    pendingReordReset_ = true;
+    assocStatus_       = 0xFFFFU;
     disconnectReason_ = 0U;
     eapolHead_        = 0U;
     eapolTail_        = 0U;
@@ -1829,11 +1945,12 @@ IOReturn AIC8800WiFi::ctlDisconnect(const aic_wifi_disconnect_req_t *req) {
     uint8_t oldStaIdx = 0U;
     bool wasAssoc = false;
     IOLockLock(stateLock_);
-    wasAssoc    = associated_;
-    oldStaIdx   = apStaIdx_;
-    associated_ = false;
-    linkUp_     = false;
-    eapolHead_  = 0U;
+    wasAssoc           = associated_;
+    oldStaIdx          = apStaIdx_;
+    associated_        = false;
+    linkUp_            = false;
+    pendingReordReset_ = true;
+    eapolHead_         = 0U;
     eapolTail_  = 0U;
     eapolCount_ = 0U;
     IOLockUnlock(stateLock_);

@@ -67,7 +67,7 @@ $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker: $(OBJ_DIR)/msc/kmod_info.o $(OBJ_D
 $(OBJ_DIR)/wifi/kmod_info.o: kexts/AIC8800WiFi/kmod_info.c | $(OBJ_DIR)/wifi
 	$(CC) $(WIFI_CFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/wifi/AIC8800WiFi.o: kexts/AIC8800WiFi/AIC8800WiFi.cpp kexts/AIC8800WiFi/AIC8800WiFi.hpp kexts/AIC8800WiFi/AIC8800WiFiUserClient.hpp common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h common/aic8800_wifi_ctl.h | $(OBJ_DIR)/wifi
+$(OBJ_DIR)/wifi/AIC8800WiFi.o: kexts/AIC8800WiFi/AIC8800WiFi.cpp kexts/AIC8800WiFi/AIC8800WiFi.hpp kexts/AIC8800WiFi/AIC8800WiFiUserClient.hpp common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h common/aic8800_reord.h common/aic8800_wifi_ctl.h | $(OBJ_DIR)/wifi
 	$(CXX) $(WIFI_CXXFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/wifi/AIC8800WiFiUserClient.o: kexts/AIC8800WiFi/AIC8800WiFiUserClient.cpp kexts/AIC8800WiFi/AIC8800WiFiUserClient.hpp kexts/AIC8800WiFi/AIC8800WiFi.hpp common/aic8800_wifi_ctl.h | $(OBJ_DIR)/wifi
@@ -128,12 +128,12 @@ $(TEST_PHASE2): tests/test_phase2_bt.cpp common/aic8800_abi.h | $(BUILD_DIR)
 		-Wall -Wextra -Werror -Icommon \
 		$< -o $@
 
-$(TEST_PHASE3): tests/test_phase3_wifi.cpp common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h common/aic8800_wifi_ctl.h common/aic8800_wpa2.h | $(BUILD_DIR)
+$(TEST_PHASE3): tests/test_phase3_wifi.cpp common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h common/aic8800_reord.h common/aic8800_wifi_ctl.h common/aic8800_wpa2.h | $(BUILD_DIR)
 	$(CXX) -std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all \
 		-Wall -Wextra -Werror -Wno-deprecated-declarations -Icommon \
 		$< -o $@
 
-$(TEST_NOHEAP): tests/test_hotpath_noheap.c common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h | $(BUILD_DIR)
+$(TEST_NOHEAP): tests/test_hotpath_noheap.c common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h common/aic8800_reord.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -Icommon $< -o $@
 
 $(TEST_DAEMON): tests/test_fwload_daemon.c common/aic8800_abi.h common/aic8800_fwload_ctl.h | $(BUILD_DIR)
@@ -155,13 +155,15 @@ test: all $(TEST_ABI) $(TEST_PHASE0) $(TEST_PHASE1) $(TEST_PHASE2) $(TEST_PHASE3
 	./$(TEST_NOHEAP)
 	@echo "--- Running ASan + UBSan fwload daemon control-plane suite ---"
 	./$(TEST_DAEMON)
-	@echo "--- Validating LaunchDaemon plist ---"
+	@echo "--- Validating LaunchDaemon plists & CLI help ---"
 	plutil -lint daemon/com.rush.aic8800_fwload.plist
+	plutil -lint daemon/com.rush.aic8800_wifi.plist
+	./$(WIFI_CLI) --help >/dev/null
 	@echo "--- Running aic8800_fwload --help & --dry-run (Stage 1 5 GHz patch validation) ---"
 	./$(FWLOAD) --help >/dev/null
 	./$(FWLOAD) --fw-dir "$(FW_DIR)" --dry-run
 	@echo "--- Inspecting Mach-O types & kext KPI purity ---"
-	file $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi $(BT_KEXT)/Contents/MacOS/AIC8800BTQuirk $(FWLOAD)
+	file $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi $(BT_KEXT)/Contents/MacOS/AIC8800BTQuirk $(FWLOAD) $(WIFI_CLI)
 	@echo "Checking AIC8800MSCBlocker & AIC8800WiFi undefined symbols for private/Lilu leakage:"
 	@if nm -u $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi | grep -E "Lilu|lilu|KernelPatcher|Apple80211|IOMallocPage"; then exit 1; else echo "OK: AIC8800MSCBlocker & AIC8800WiFi pure public KPI"; fi
 

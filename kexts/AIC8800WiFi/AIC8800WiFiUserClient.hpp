@@ -41,3 +41,4 @@ private:
 };
 
 #endif /* AIC8800_WIFI_USERCLIENT_HPP */
+

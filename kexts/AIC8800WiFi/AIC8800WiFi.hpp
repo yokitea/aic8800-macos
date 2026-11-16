@@ -14,6 +14,7 @@
 #include "aic8800_abi.h"
 #include "aic8800_framing.h"
 #include "aic8800_lmac.h"
+#include "aic8800_reord.h"
 #include "aic8800_wifi_ctl.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -131,9 +132,15 @@ private:
     void handleAsyncLmacEvent(uint16_t msgId, const uint8_t *param, uint16_t paramLen);
     void enqueueEapolRx(const uint8_t *ethFrame, size_t ethLen);
     void applyCurrentLinkStatus();
+    void resetReordWindow();
+
+    static void reordDeliverFn(void *headPkt, uint32_t totalBytes, void *ctx);
+    static void reordAppendFn(void *tailPkt, void *newPkt);
+    static void reordDropFn(void *headPkt, void *ctx);
 
     static void onAsyncLmacCallback(uint16_t msgId, const uint8_t *param, uint16_t paramLen, void *ctx);
     static void onLinkSyncTimer(OSObject *owner, IOTimerEventSource *sender);
+    static void onReordTimer(OSObject *owner, IOTimerEventSource *sender);
     static IOReturn onWorkLoopSyncLink(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
 
     static void onRxComplete(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred);
@@ -148,6 +155,7 @@ private:
 
     IOWorkLoop          *workLoop_      = nullptr;
     IOTimerEventSource  *linkSyncTimer_ = nullptr;
+    IOTimerEventSource  *reordTimer_    = nullptr;
     IOEthernetInterface *netIf_         = nullptr;
     IONetworkStats      *netStats_      = nullptr;
     OSDictionary        *mediumDict_    = nullptr;
@@ -202,6 +210,8 @@ private:
     uint16_t eapolCount_       = 0U;
     uint64_t eapolRxTotal_     = 0U;
     aic_wifi_eapol_frame_t eapolRxRing_[AIC_WIFI_EAPOL_RING_CAP] = {};
+    volatile bool          pendingReordReset_                    = false;
+    aic_rx_reord_t         reord_                                = {};
 
     aic_fixed_slot_pool_t     txPool_                           = {};
     aic_tx_flow_ctrl_t        txFlowCtrl_                       = {};

@@ -1,5 +1,5 @@
 /*
- * aic8800_wifi.c - User-space Wi-Fi scan/connect/WPA2-PSK supplicant CLI
+ * aic8800_wifi.c - User-space Wi-Fi scan/connect/auto-daemon & WPA2-PSK CLI
  *
  * Connects to AIC8800WiFiUserClient (admin privilege required) via pure public
  * IOKit + CoreFoundation + CommonCrypto APIs.
@@ -8,37 +8,51 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "aic8800_abi.h"
 #include "aic8800_wifi_ctl.h"
 #include "aic8800_wpa2.h"
 
+#define AIC_WIFI_CONF_DIR  "/Library/Application Support/AIC8800"
+#define AIC_WIFI_CONF_PATH "/Library/Application Support/AIC8800/wifi.conf"
+
+extern char **environ;
+
 static volatile sig_atomic_t g_keep_running = 1;
 
-static void on_sigint(int sig) {
+static void on_sigterm(int sig) {
     (void)sig;
     g_keep_running = 0;
 }
 
-static int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc) {
+static int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet) {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
                                                    IOServiceMatching("AIC8800WiFi"));
     if (svc == IO_OBJECT_NULL) {
-        fprintf(stderr, "error: AIC8800WiFi service not found (is dongle plugged & kext loaded?)\n");
+        if (!quiet) {
+            fprintf(stderr, "error: AIC8800WiFi service not found (is dongle plugged & kext loaded?)\n");
+        }
         return -1;
     }
 
     io_connect_t conn = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), AIC_WIFI_USERCLIENT_TYPE, &conn);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "error: IOServiceOpen failed: 0x%08x (try sudo?)\n", kr);
+        if (!quiet) {
+            fprintf(stderr, "error: IOServiceOpen failed: 0x%08x (try sudo?)\n", kr);
+        }
         IOObjectRelease(svc);
         return -1;
     }
@@ -61,6 +75,22 @@ static void get_bsd_name(io_service_t svc, char *buf, size_t cap) {
         }
         CFRelease(val);
     }
+}
+
+static int trigger_dhcp(const char *bsd) {
+    if (!bsd || strcmp(bsd, "unknown") == 0 || strncmp(bsd, "en", 2) != 0) {
+        return -1;
+    }
+    char *argv_dhcp[] = { (char *)"ipconfig", (char *)"set", (char *)bsd, (char *)"DHCP", NULL };
+    pid_t pid = 0;
+    const int rc = posix_spawn(&pid, "/usr/sbin/ipconfig", NULL, NULL, argv_dhcp, environ);
+    if (rc != 0) {
+        return -1;
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 static kern_return_t uc_get_status(io_connect_t conn, aic_wifi_status_t *out) {
@@ -180,7 +210,7 @@ static int run_scan_and_wait(io_connect_t conn,
     }
 
     for (int i = 0; i < 60; ++i) {
-        usleep(100000); /* 100 ms */
+        usleep(100000);
         kr = uc_get_scan_results(conn, out_list);
         if (kr != KERN_SUCCESS) {
             fprintf(stderr, "error: GET_SCAN_RESULTS failed: 0x%08x\n", kr);
@@ -258,11 +288,13 @@ static int cmd_scan(io_connect_t conn) {
     return 0;
 }
 
-static int cmd_connect(io_connect_t conn,
-                       io_service_t svc,
-                       const char *ssid_arg,
-                       const char *passphrase,
-                       bool stay_for_rekey) {
+static int perform_connect(io_connect_t conn,
+                           io_service_t svc,
+                           const char *ssid_arg,
+                           const char *passphrase,
+                           bool run_dhcp,
+                           aic_wpa2_ctx_t *out_wpa_ctx,
+                           bool *out_is_open) {
     const size_t ssid_len = strlen(ssid_arg);
     if (ssid_len == 0U || ssid_len > 32U) {
         fprintf(stderr, "error: invalid SSID length\n");
@@ -305,7 +337,7 @@ static int cmd_connect(io_connect_t conn,
     const bool has_wpa2 = (target->sec_mask & AIC_SEC_WPA2_PSK) != 0U;
 
     if (!is_open && !has_wpa2) {
-        fprintf(stderr, "error: security mode '%s' is not supported in Phase 3A (requires OPEN or WPA2-PSK/Mixed)\n",
+        fprintf(stderr, "error: security mode '%s' is not supported (requires OPEN or WPA2-PSK/Mixed)\n",
                 sec_str);
         return 1;
     }
@@ -314,13 +346,13 @@ static int cmd_connect(io_connect_t conn,
     uint8_t rsn_ie[22] = {0};
     size_t rsn_ie_len = 0U;
     if (!is_open) {
-        if (!passphrase) {
-            fprintf(stderr, "error: passphrase required for %s\n", sec_str);
+        if (!passphrase || strlen(passphrase) < 8U) {
+            fprintf(stderr, "error: valid 8..63 char passphrase required for %s\n", sec_str);
             return 1;
         }
         if (aic_wpa2_derive_pmk(passphrase, strlen(passphrase),
                                 target->ssid, target->ssid_len, pmk) != 0) {
-            fprintf(stderr, "error: PBKDF2 passphrase derivation failed (passphrase must be 8..63 chars)\n");
+            fprintf(stderr, "error: PBKDF2 passphrase derivation failed\n");
             return 1;
         }
         const uint8_t grp = (target->group_cipher != AIC_CIPHER_INVALID) ? target->group_cipher : AIC_CIPHER_CCMP;
@@ -336,7 +368,7 @@ static int cmd_connect(io_connect_t conn,
     memcpy(creq.bssid, target->bssid, AIC_MAC_ADDR_LEN);
     creq.band      = target->band;
     creq.freq      = target->freq;
-    creq.auth_type = 0U; /* WLAN_AUTH_OPEN */
+    creq.auth_type = 0U;
     if (!is_open) {
         creq.flags               = AIC_CONTROL_PORT_HOST | AIC_WPA_WPA2_IN_USE;
         creq.ctrl_port_ethertype = htons(AIC_EAPOL_ETHERTYPE);
@@ -372,22 +404,23 @@ static int cmd_connect(io_connect_t conn,
            st.ap_sta_idx, st.ap_bssid[0], st.ap_bssid[1], st.ap_bssid[2],
            st.ap_bssid[3], st.ap_bssid[4], st.ap_bssid[5], st.ap_center_freq);
 
-    aic_wpa2_ctx_t wpa_ctx;
+    aic_wpa2_ctx_t local_ctx;
+    aic_wpa2_ctx_t *wpa_ctx = out_wpa_ctx ? out_wpa_ctx : &local_ctx;
     if (!is_open) {
         printf("[3/4] Running WPA2-PSK 4-Way Handshake...\n");
         const uint8_t pw = (target->pairwise_cipher != AIC_CIPHER_INVALID) ? target->pairwise_cipher : AIC_CIPHER_CCMP;
         const uint8_t grp = (target->group_cipher != AIC_CIPHER_INVALID) ? target->group_cipher : AIC_CIPHER_CCMP;
-        aic_wpa2_ctx_init(&wpa_ctx, st.mac_addr, st.ap_bssid, pmk, rsn_ie, (uint8_t)rsn_ie_len, pw, grp);
+        aic_wpa2_ctx_init(wpa_ctx, st.mac_addr, st.ap_bssid, pmk, rsn_ie, (uint8_t)rsn_ie_len, pw, grp);
 
         bool keys_installed = false;
-        for (int i = 0; i < 600 && !keys_installed; ++i) { /* up to 6s */
+        for (int i = 0; i < 600 && !keys_installed; ++i) {
             aic_wifi_eapol_frame_t rx_frame;
             if (uc_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
                 uint8_t reply_eth[AIC_WIFI_EAPOL_MAX_FRAME];
                 size_t reply_len = 0U;
                 bool keys_ready = false;
                 bool gtk_rekey  = false;
-                const int hrc = aic_wpa2_handle_rx_eapol(&wpa_ctx,
+                const int hrc = aic_wpa2_handle_rx_eapol(wpa_ctx,
                                                          rx_frame.data,
                                                          rx_frame.len,
                                                          reply_eth,
@@ -409,20 +442,20 @@ static int cmd_connect(io_connect_t conn,
                 }
                 if (keys_ready) {
                     uint8_t hw_idx = 0U;
-                    kr = uc_add_key(conn, 0U, true, wpa_ctx.pairwise_cipher, &wpa_ctx.ptk[32], 16U, &hw_idx);
+                    kr = uc_add_key(conn, 0U, true, wpa_ctx->pairwise_cipher, &wpa_ctx->ptk[32], 16U, &hw_idx);
                     if (kr != KERN_SUCCESS) {
                         fprintf(stderr, "error: install PTK failed: 0x%08x\n", kr);
                         return 1;
                     }
                     printf("      Installed PTK (hw_key_idx=%u)\n", hw_idx);
-                    if (wpa_ctx.has_gtk) {
-                        kr = uc_add_key(conn, wpa_ctx.gtk_idx, false, wpa_ctx.group_cipher,
-                                        wpa_ctx.gtk, wpa_ctx.gtk_len, &hw_idx);
+                    if (wpa_ctx->has_gtk) {
+                        kr = uc_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
+                                        wpa_ctx->gtk, wpa_ctx->gtk_len, &hw_idx);
                         if (kr != KERN_SUCCESS) {
                             fprintf(stderr, "error: install GTK failed: 0x%08x\n", kr);
                             return 1;
                         }
-                        printf("      Installed GTK idx=%u (hw_key_idx=%u)\n", wpa_ctx.gtk_idx, hw_idx);
+                        printf("      Installed GTK idx=%u (hw_key_idx=%u)\n", wpa_ctx->gtk_idx, hw_idx);
                     }
                     keys_installed = true;
                 }
@@ -449,23 +482,91 @@ static int cmd_connect(io_connect_t conn,
         return 1;
     }
 
-    printf("Connected! Next, verify IP/DHCP on %s (or run: sudo ipconfig set %s DHCP)\n", bsd, bsd);
+    if (run_dhcp) {
+        const int drc = trigger_dhcp(bsd);
+        printf("      DHCP trigger on %s: rc=%d\n", bsd, drc);
+    }
 
-    if (stay_for_rekey && !is_open) {
-        printf("Supplicant staying resident for GTK rekeying (Ctrl+C to exit without disconnecting)...\n");
-        signal(SIGINT, on_sigint);
-        while (g_keep_running) {
-            if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.associated) {
-                fprintf(stderr, "notice: AP disconnected (reason=%u)\n", st.disconnect_reason);
-                break;
-            }
+    if (out_is_open) {
+        *out_is_open = is_open;
+    }
+    return 0;
+}
+
+static int save_profile(const char *ssid, const char *pass) {
+    const size_t slen = strlen(ssid);
+    if (slen == 0U || slen > 32U || strchr(ssid, '\n') || strchr(ssid, '\r')) {
+        fprintf(stderr, "error: invalid SSID\n");
+        return 1;
+    }
+    if (pass && (strlen(pass) < 8U || strlen(pass) > 63U || strchr(pass, '\n') || strchr(pass, '\r'))) {
+        fprintf(stderr, "error: passphrase must be 8..63 chars\n");
+        return 1;
+    }
+
+    (void)mkdir(AIC_WIFI_CONF_DIR, 0755);
+    const int fd = open(AIC_WIFI_CONF_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "error: failed to write %s: %s (try sudo?)\n", AIC_WIFI_CONF_PATH, strerror(errno));
+        return 1;
+    }
+    (void)fchmod(fd, 0600);
+
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        return 1;
+    }
+    fprintf(fp, "ssid=%s\n", ssid);
+    if (pass) {
+        fprintf(fp, "psk=%s\n", pass);
+    }
+    fclose(fp);
+    printf("Saved Wi-Fi profile to %s (mode 0600)\n", AIC_WIFI_CONF_PATH);
+    return 0;
+}
+
+static bool load_profile(char *ssid_out, size_t ssid_cap, char *pass_out, size_t pass_cap, bool *has_pass) {
+    *has_pass = false;
+    memset(ssid_out, 0, ssid_cap);
+    memset(pass_out, 0, pass_cap);
+
+    FILE *fp = fopen(AIC_WIFI_CONF_PATH, "r");
+    if (!fp) {
+        return false;
+    }
+    char line[128];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t l = strlen(line);
+        while (l > 0U && (line[l - 1U] == '\n' || line[l - 1U] == '\r')) {
+            line[--l] = '\0';
+        }
+        if (strncmp(line, "ssid=", 5U) == 0) {
+            snprintf(ssid_out, ssid_cap, "%s", line + 5U);
+        } else if (strncmp(line, "psk=", 4U) == 0) {
+            snprintf(pass_out, pass_cap, "%s", line + 4U);
+            *has_pass = (pass_out[0] != '\0');
+        }
+    }
+    fclose(fp);
+    return (ssid_out[0] != '\0');
+}
+
+static void run_rekey_loop(io_connect_t conn, aic_wpa2_ctx_t *wpa_ctx, bool is_open) {
+    while (g_keep_running) {
+        aic_wifi_status_t st;
+        if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready || !st.associated) {
+            fprintf(stderr, "notice: Wi-Fi link lost/disconnected (reason=%u)\n", st.disconnect_reason);
+            break;
+        }
+        if (!is_open) {
             aic_wifi_eapol_frame_t rx_frame;
             if (uc_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
                 uint8_t reply_eth[AIC_WIFI_EAPOL_MAX_FRAME];
                 size_t reply_len = 0U;
                 bool keys_ready = false;
                 bool gtk_rekey  = false;
-                if (aic_wpa2_handle_rx_eapol(&wpa_ctx,
+                if (aic_wpa2_handle_rx_eapol(wpa_ctx,
                                              rx_frame.data,
                                              rx_frame.len,
                                              reply_eth,
@@ -474,35 +575,101 @@ static int cmd_connect(io_connect_t conn,
                                              &keys_ready,
                                              &gtk_rekey) == 1) {
                     (void)uc_send_eapol(conn, reply_eth, reply_len);
-                    if (gtk_rekey && wpa_ctx.has_gtk) {
+                    if (gtk_rekey && wpa_ctx->has_gtk) {
                         uint8_t hw_idx = 0U;
-                        (void)uc_add_key(conn, wpa_ctx.gtk_idx, false, wpa_ctx.group_cipher,
-                                         wpa_ctx.gtk, wpa_ctx.gtk_len, &hw_idx);
+                        (void)uc_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
+                                         wpa_ctx->gtk, wpa_ctx->gtk_len, &hw_idx);
                     }
                 }
-            } else {
-                usleep(200000);
             }
         }
+        usleep(250000);
     }
+}
+
+static int run_daemon(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    signal(SIGINT, on_sigterm);
+    signal(SIGTERM, on_sigterm);
+
+    printf("aic8800_wifi daemon starting (profile=%s)\n", AIC_WIFI_CONF_PATH);
+
+    while (g_keep_running) {
+        char ssid[36] = {0};
+        char pass[72] = {0};
+        bool has_pass = false;
+        if (!load_profile(ssid, sizeof(ssid), pass, sizeof(pass), &has_pass)) {
+            sleep(3);
+            continue;
+        }
+
+        io_connect_t conn = IO_OBJECT_NULL;
+        io_service_t svc  = IO_OBJECT_NULL;
+        if (open_wifi_client(&conn, &svc, true) != 0) {
+            sleep(2);
+            continue;
+        }
+
+        aic_wifi_status_t st;
+        if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
+            IOServiceClose(conn);
+            IOObjectRelease(svc);
+            sleep(1);
+            continue;
+        }
+
+        if (!st.associated || !st.link_up) {
+            aic_wpa2_ctx_t wpa_ctx;
+            bool is_open = false;
+            if (perform_connect(conn, svc, ssid, has_pass ? pass : NULL, true, &wpa_ctx, &is_open) == 0) {
+                run_rekey_loop(conn, &wpa_ctx, is_open);
+            } else {
+                sleep(3);
+            }
+        } else {
+            sleep(2);
+        }
+
+        IOServiceClose(conn);
+        IOObjectRelease(svc);
+        if (g_keep_running) {
+            sleep(1);
+        }
+    }
+    printf("aic8800_wifi daemon stopping.\n");
     return 0;
 }
 
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+            "Usage:\n"
+            "  sudo %s status\n"
+            "  sudo %s scan\n"
+            "  sudo %s connect <SSID> [passphrase] [--no-dhcp] [--stay]\n"
+            "  sudo %s save <SSID> [passphrase]    (save auto-connect profile to wifi.conf)\n"
+            "  sudo %s disconnect\n"
+            "  sudo %s --daemon\n",
+            prog, prog, prog, prog, prog, prog);
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr,
-                "Usage:\n"
-                "  sudo %s status\n"
-                "  sudo %s scan\n"
-                "  sudo %s connect <SSID> [passphrase] [--stay]\n"
-                "  sudo %s disconnect\n",
-                argv[0], argv[0], argv[0], argv[0]);
-        return 2;
+    if (argc < 2 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        print_usage(argv[0]);
+        return (argc < 2) ? 2 : 0;
+    }
+
+    if (strcmp(argv[1], "--daemon") == 0) {
+        return run_daemon();
+    }
+    if (strcmp(argv[1], "save") == 0 && argc >= 3) {
+        const char *pass = (argc >= 4) ? argv[3] : NULL;
+        return save_profile(argv[2], pass);
     }
 
     io_connect_t conn = IO_OBJECT_NULL;
     io_service_t svc  = IO_OBJECT_NULL;
-    if (open_wifi_client(&conn, &svc) != 0) {
+    if (open_wifi_client(&conn, &svc, false) != 0) {
         return 1;
     }
 
@@ -515,14 +682,25 @@ int main(int argc, char **argv) {
         const char *ssid = argv[2];
         const char *pass = NULL;
         bool stay = false;
+        bool run_dhcp = true;
         for (int i = 3; i < argc; ++i) {
             if (strcmp(argv[i], "--stay") == 0) {
                 stay = true;
+            } else if (strcmp(argv[i], "--no-dhcp") == 0) {
+                run_dhcp = false;
             } else if (!pass) {
                 pass = argv[i];
             }
         }
-        rc = cmd_connect(conn, svc, ssid, pass, stay);
+        aic_wpa2_ctx_t wpa_ctx;
+        bool is_open = false;
+        rc = perform_connect(conn, svc, ssid, pass, run_dhcp, &wpa_ctx, &is_open);
+        if (rc == 0 && stay) {
+            signal(SIGINT, on_sigterm);
+            signal(SIGTERM, on_sigterm);
+            printf("Supplicant staying resident for GTK rekeying (Ctrl+C to exit)...\n");
+            run_rekey_loop(conn, &wpa_ctx, is_open);
+        }
     } else if (strcmp(argv[1], "disconnect") == 0) {
         const kern_return_t kr = uc_disconnect(conn, 3U);
         if (kr != KERN_SUCCESS) {
@@ -532,7 +710,7 @@ int main(int argc, char **argv) {
             printf("Disconnected.\n");
         }
     } else {
-        fprintf(stderr, "error: unknown command '%s'\n", argv[1]);
+        print_usage(argv[0]);
         rc = 2;
     }
 

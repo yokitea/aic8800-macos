@@ -6,6 +6,7 @@
 #include "aic8800_abi.h"
 #include "aic8800_framing.h"
 #include "aic8800_lmac.h"
+#include "aic8800_reord.h"
 #include "aic8800_wifi_ctl.h"
 #include "aic8800_wpa2.h"
 
@@ -288,12 +289,124 @@ static void test_async_dispatch_ex(void) {
     assert(g_async_hits == 1 && g_last_async_id == AIC_SCANU_RESULT_IND);
 }
 
+struct FakePkt {
+    uint16_t sn;
+    uint16_t sub;
+    FakePkt *next;
+};
+
+struct ReordTestCtx {
+    uint32_t delivered_sns[512];
+    uint32_t delivered_subs[512];
+    size_t   delivered_cnt;
+    size_t   dropped_cnt;
+};
+
+static void fake_deliver(void *head_pkt, uint32_t total_bytes, void *ctx) {
+    (void)total_bytes;
+    ReordTestCtx *tc = (ReordTestCtx *)ctx;
+    FakePkt *cur = (FakePkt *)head_pkt;
+    while (cur) {
+        assert(tc->delivered_cnt < 512U);
+        tc->delivered_sns[tc->delivered_cnt]  = cur->sn;
+        tc->delivered_subs[tc->delivered_cnt] = cur->sub;
+        tc->delivered_cnt++;
+        cur = cur->next;
+    }
+}
+
+static void fake_append(void *tail_pkt, void *new_pkt) {
+    FakePkt *t = (FakePkt *)tail_pkt;
+    FakePkt *n = (FakePkt *)new_pkt;
+    t->next = n;
+    n->next = NULL;
+}
+
+static void fake_drop(void *head_pkt, void *ctx) {
+    ReordTestCtx *tc = (ReordTestCtx *)ctx;
+    FakePkt *cur = (FakePkt *)head_pkt;
+    while (cur) {
+        tc->dropped_cnt++;
+        cur = cur->next;
+    }
+}
+
+static void test_rx_reorder_window(void) {
+    aic_rx_reord_t r;
+    aic_rx_reord_init(&r);
+    ReordTestCtx tc;
+    memset(&tc, 0, sizeof(tc));
+
+    /* 1. 12-bit SN wrap-around out-of-order burst: anchor 4092, then 4095..4093 reverse, plus A-MSDU at 4094 & 0..2 */
+    FakePkt pkts[32];
+    memset(pkts, 0, sizeof(pkts));
+    bool need_timer = false;
+
+    pkts[0].sn = 4092U;
+    aic_rx_reord_submit(&r, 0U, 4092U, &pkts[0], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    assert(tc.delivered_cnt == 1U && tc.delivered_sns[0] == 4092U && !need_timer);
+
+    /* Send 4095, 4094 (with 2 A-MSDU subframes!), 1, 0 out-of-order; duplicate 4095 must be dropped */
+    pkts[1].sn = 4095U;
+    aic_rx_reord_submit(&r, 0U, 4095U, &pkts[1], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    assert(tc.delivered_cnt == 1U && need_timer);
+
+    pkts[2].sn = 4095U;
+    aic_rx_reord_submit(&r, 0U, 4095U, &pkts[2], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    assert(tc.dropped_cnt == 1U && r.dup_drops == 1U);
+
+    pkts[3].sn = 4094U; pkts[3].sub = 0U;
+    pkts[4].sn = 4094U; pkts[4].sub = 1U;
+    aic_rx_reord_submit(&r, 0U, 4094U, &pkts[3], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    aic_rx_reord_submit(&r, 0U, 4094U, &pkts[4], 100U, true,  fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+
+    pkts[5].sn = 1U;
+    pkts[6].sn = 0U;
+    aic_rx_reord_submit(&r, 0U, 1U, &pkts[5], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    aic_rx_reord_submit(&r, 0U, 0U, &pkts[6], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    assert(tc.delivered_cnt == 1U);
+
+    /* Fill gap 4093 -> MUST flush 4093, 4094(sub0), 4094(sub1), 4095, 0, 1 in exact order! */
+    pkts[7].sn = 4093U;
+    aic_rx_reord_submit(&r, 0U, 4093U, &pkts[7], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    assert(tc.delivered_cnt == 7U && !need_timer);
+    const uint32_t exp_sns[7]  = {4092, 4093, 4094, 4094, 4095, 0, 1};
+    const uint32_t exp_subs[7] = {0,    0,    0,    1,    0,    0, 0};
+    for (size_t i = 0U; i < 7U; ++i) {
+        assert(tc.delivered_sns[i] == exp_sns[i] && tc.delivered_subs[i] == exp_subs[i]);
+    }
+    assert(r.tids[0].ind_sn == 2U && r.tids[0].pending_count == 0U);
+
+    /* 2. Timeout flush test across a missing SN (gap at 2, buffer 3, 4, gap at 5, buffer 6) */
+    tc.delivered_cnt = 0U;
+    pkts[8].sn = 3U; pkts[9].sn = 4U; pkts[10].sn = 6U;
+    aic_rx_reord_submit(&r, 0U, 3U, &pkts[8],  100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    aic_rx_reord_submit(&r, 0U, 4U, &pkts[9],  100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    aic_rx_reord_submit(&r, 0U, 6U, &pkts[10], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    assert(tc.delivered_cnt == 0U);
+    assert(aic_rx_reord_timeout_flush(&r, fake_deliver, &tc) == true); /* delivers 3, 4; 6 still pending */
+    assert(tc.delivered_cnt == 2U && tc.delivered_sns[0] == 3U && tc.delivered_sns[1] == 4U);
+    assert(aic_rx_reord_timeout_flush(&r, fake_deliver, &tc) == false); /* delivers 6 */
+    assert(tc.delivered_cnt == 3U && tc.delivered_sns[2] == 6U);
+
+    /* 3. Window jump (> 64 distance) must advance window cleanly without slot aliasing */
+    tc.delivered_cnt = 0U;
+    pkts[11].sn = 10U; pkts[12].sn = 100U;
+    aic_rx_reord_submit(&r, 0U, 10U,  &pkts[11], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    aic_rx_reord_submit(&r, 0U, 100U, &pkts[12], 100U, false, fake_deliver, fake_append, fake_drop, &tc, &need_timer);
+    assert(tc.delivered_cnt == 1U && tc.delivered_sns[0] == 10U && r.window_jumps == 1U);
+    aic_rx_reord_flush_all(&r, false, fake_deliver, fake_drop, &tc);
+    assert(tc.delivered_cnt == 2U && tc.delivered_sns[1] == 100U && r.tids[0].pending_count == 0U);
+}
+
 int main(void) {
     test_rfc4493_aes_cmac();
     test_ieee80211_pbkdf2();
     test_scanu_parsing();
     test_wpa2_4way_and_gtk_rekey();
     test_async_dispatch_ex();
-    printf("[PASS] Phase 3 Wi-Fi suite passed (RFC 4493 CMAC, IEEE PBKDF2/4-way+GTK rekey, SCANU parser, async E2A)\n");
+    test_rx_reorder_window();
+    printf("[PASS] Phase 3 Wi-Fi suite passed (RFC 4493 CMAC, IEEE PBKDF2/4-way+GTK, SCANU, RX BA reorder)\n");
     return 0;
 }
+

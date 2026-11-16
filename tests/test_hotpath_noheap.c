@@ -9,6 +9,23 @@
 #include "aic8800_abi.h"
 #include "aic8800_framing.h"
 #include "aic8800_lmac.h"
+#include "aic8800_reord.h"
+
+static void noop_reord_deliver(void *head_pkt, uint32_t total_bytes, void *ctx) {
+    (void)head_pkt;
+    (void)total_bytes;
+    (void)ctx;
+}
+
+static void noop_reord_append(void *tail_pkt, void *new_pkt) {
+    (void)tail_pkt;
+    (void)new_pkt;
+}
+
+static void noop_reord_drop(void *head_pkt, void *ctx) {
+    (void)head_pkt;
+    (void)ctx;
+}
 
 static bool g_in_hot_path = false;
 static uint64_t g_hot_path_heap_allocs = 0;
@@ -108,6 +125,9 @@ int main(void) {
     };
     memcpy(&msg_urb[4], &e2a, sizeof(e2a));
 
+    static aic_rx_reord_t reord;
+    aic_rx_reord_init(&reord);
+
     g_in_hot_path = true;
     for (int i = 0; i < 10000; i++) {
         uint16_t slot = 0;
@@ -122,6 +142,13 @@ int main(void) {
         assert(aic_rx_demux_usb_aggr(usb_rx, AIC_RX_HWHDR_LEN + 40U, noop_data_cb, NULL, NULL) == 1);
         assert(aic_rx_chunk_to_eth_frames(usb_rx, AIC_RX_HWHDR_LEN + 40U, scratch, sizeof(scratch),
                                           noop_eth_cb, NULL) == 1);
+        bool need_timer = false;
+        const uint16_t sn = (uint16_t)((i ^ ((i & 1) ? 1 : 0)) & AIC_REORD_SN_MASK);
+        aic_rx_reord_submit(&reord, 0U, sn, scratch, 64U, false,
+                            noop_reord_deliver, noop_reord_append, noop_reord_drop, NULL, &need_timer);
+        if ((i & 63) == 63) {
+            (void)aic_rx_reord_timeout_flush(&reord, noop_reord_deliver, NULL);
+        }
 
         aic_fill_d80_txpwr_lvl_v3(&pwr_req);
         aic_build_d80_rf_calib_req(&calib_req);

@@ -297,6 +297,13 @@ static inline void aic_build_d80_agg_disable_req(aic_mm_set_agg_disable_req_t *r
     req->disable_rx = 1U;
 }
 
+static inline void aic_build_d80_agg_enable_req(aic_mm_set_agg_disable_req_t *req) {
+    aic_lmac_zero(req, sizeof(*req));
+    req->disable    = 0U;
+    req->staidx     = 0U;
+    req->disable_rx = 0U;
+}
+
 /* ==========================================================================
  * Zero-Heap LMAC Command Matcher & Bulk-In Msg Demuxer
  * ========================================================================== */

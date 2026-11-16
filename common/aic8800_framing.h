@@ -247,6 +247,9 @@ typedef struct {
     bool     is_eapol;
     bool     is_amsdu;
     bool     is_mgmt_mpdu;
+    bool     is_qos;
+    bool     need_reord;
+    uint8_t  amsdu_sub_idx;
 } aic_rx_frame_meta_t;
 
 typedef void (*aic_rx_eth_cb_t)(const uint8_t *eth_frame,
@@ -277,8 +280,9 @@ static inline int aic_rx_chunk_to_eth_frames(const uint8_t *chunk,
 
     aic_rx_frame_meta_t meta;
     memset(&meta, 0, sizeof(meta));
-    meta.vif_idx = (uint8_t)rxhdr.flags_vif_idx;
-    meta.sta_idx = (uint8_t)rxhdr.flags_sta_idx;
+    meta.vif_idx    = (uint8_t)rxhdr.flags_vif_idx;
+    meta.sta_idx    = (uint8_t)rxhdr.flags_sta_idx;
+    meta.need_reord = (rxhdr.flags_need_reord != 0U);
 
     if (rxhdr.flags_is_80211_mpdu) {
         meta.is_mgmt_mpdu = true;
@@ -293,6 +297,7 @@ static inline int aic_rx_chunk_to_eth_frames(const uint8_t *chunk,
     bool is_qos = ((mac[0] & 0x80U) == 0x80U);
     bool is_htc = ((mac[1] & 0x80U) != 0U);
     bool is_amsdu = false;
+    meta.is_qos = is_qos;
 
     if (is_qos) {
         if (mac_len < hdr_len + 2U)
@@ -404,6 +409,7 @@ static inline int aic_rx_chunk_to_eth_frames(const uint8_t *chunk,
         memcpy(&scratch_eth_buf[12], &sub[20], (size_t)sublen - 6U);
 
         aic_rx_frame_meta_t sub_meta = meta;
+        sub_meta.amsdu_sub_idx = (uint8_t)emitted;
         sub_meta.ethertype_be = aic_get_be16(&scratch_eth_buf[12]);
         sub_meta.is_eapol = (scratch_eth_buf[12] == 0x88U && scratch_eth_buf[13] == 0x8EU) ||
                             (scratch_eth_buf[12] == 0x8EU && scratch_eth_buf[13] == 0x88U);
