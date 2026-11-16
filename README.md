@@ -1,6 +1,10 @@
 # aic8800-macos
 
-macOS kernel extensions, user-space firmware loader, WPA2-PSK supplicant daemon, and HeliPort-style menu bar app for **AICSemi AIC8800D80** (`0xa69c:0x5721` -> `0xa69c:0x8d80` -> `0x368b:0x8d81`) USB Wi-Fi 6 + Bluetooth 5.4 combo adapters on macOS Sequoia (`x86_64`).
+macOS kernel extensions, user-space firmware loader, WPA2-PSK supplicant daemon, and HeliPort-style menu bar app for **AICSemi AIC8800D80** (`0xa69c:0x5721` -> `0xa69c:0x8d80` -> `0x368b:0x8d81`) USB Wi-Fi 6 + Bluetooth 5.4 combo adapters (e.g., AX928B / AX900 Dual-Band 2-in-1 USB dongles) on macOS Sequoia (`x86_64`).
+
+<p align="center">
+  <img src="docs/aic8800d80-ax928b-dongle.jpg" alt="AX928B AX900 AIC8800D80 Wi-Fi 6 + Bluetooth 5.4 USB Adapter" width="560" />
+</p>
 
 > **Status (verified live booting directly from Internal SATA EFI on macOS Sequoia 15.8.2):**
 > - **Stage 0 -> 1 -> 2 Bring-Up**: Cold boot, S3 sleep/wake recovery, and hotplug replug via `AIC8800MSCBlocker.kext` + `aic8800_fwload`.
