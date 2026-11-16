@@ -3,21 +3,34 @@
  *
  * Connects to AIC8800WiFiUserClient (admin privilege required) via pure public
  * IOKit + CoreFoundation + CommonCrypto APIs.
+ *
+ * In --daemon mode, exposes a local root:admin (0660) UNIX domain control
+ * socket at /var/run/aic8800_wifi.sock so an unprivileged desktop Menu Bar
+ * app (AIC8800Menu.app) can query status, scan, connect, save, and disconnect
+ * without sudo prompts while keeping wifi.conf root-only (0600).
  */
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/ucred.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -27,6 +40,8 @@
 
 #define AIC_WIFI_CONF_DIR  "/Library/Application Support/AIC8800"
 #define AIC_WIFI_CONF_PATH "/Library/Application Support/AIC8800/wifi.conf"
+#define AIC_WIFI_SOCK_PATH "/var/run/aic8800_wifi.sock"
+#define AIC_IPC_BUF_SIZE   32768U
 
 extern char **environ;
 
@@ -37,7 +52,20 @@ static void on_sigterm(int sig) {
     g_keep_running = 0;
 }
 
-static int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet) {
+static void set_err(char *err_buf, size_t err_cap, const char *fmt, ...) {
+    if (!err_buf || err_cap == 0U) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err_buf, err_cap, fmt, ap);
+    va_end(ap);
+}
+
+static int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool quiet, kern_return_t *out_kr) {
+    if (out_kr) {
+        *out_kr = KERN_FAILURE;
+    }
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
                                                    IOServiceMatching("AIC8800WiFi"));
     if (svc == IO_OBJECT_NULL) {
@@ -49,6 +77,9 @@ static int open_wifi_client(io_connect_t *out_conn, io_service_t *out_svc, bool 
 
     io_connect_t conn = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), AIC_WIFI_USERCLIENT_TYPE, &conn);
+    if (out_kr) {
+        *out_kr = kr;
+    }
     if (kr != KERN_SUCCESS) {
         if (!quiet) {
             fprintf(stderr, "error: IOServiceOpen failed: 0x%08x (try sudo?)\n", kr);
@@ -202,9 +233,12 @@ static void format_sec_str(uint32_t m, char *buf, size_t cap) {
 static int run_scan_and_wait(io_connect_t conn,
                              const uint8_t *ssid,
                              uint8_t ssid_len,
-                             aic_wifi_scan_list_t *out_list) {
+                             aic_wifi_scan_list_t *out_list,
+                             char *err_buf,
+                             size_t err_cap) {
     kern_return_t kr = uc_start_scan(conn, ssid, ssid_len);
     if (kr != KERN_SUCCESS) {
+        set_err(err_buf, err_cap, "START_SCAN failed: 0x%08x", kr);
         fprintf(stderr, "error: START_SCAN failed: 0x%08x\n", kr);
         return -1;
     }
@@ -213,6 +247,7 @@ static int run_scan_and_wait(io_connect_t conn,
         usleep(100000);
         kr = uc_get_scan_results(conn, out_list);
         if (kr != KERN_SUCCESS) {
+            set_err(err_buf, err_cap, "GET_SCAN_RESULTS failed: 0x%08x", kr);
             fprintf(stderr, "error: GET_SCAN_RESULTS failed: 0x%08x\n", kr);
             return -1;
         }
@@ -265,7 +300,8 @@ static int cmd_status(io_connect_t conn, io_service_t svc) {
 
 static int cmd_scan(io_connect_t conn) {
     aic_wifi_scan_list_t list;
-    if (run_scan_and_wait(conn, NULL, 0U, &list) != 0) {
+    char err[160] = {0};
+    if (run_scan_and_wait(conn, NULL, 0U, &list, err, sizeof(err)) != 0) {
         return 1;
     }
 
@@ -294,22 +330,29 @@ static int perform_connect(io_connect_t conn,
                            const char *passphrase,
                            bool run_dhcp,
                            aic_wpa2_ctx_t *out_wpa_ctx,
-                           bool *out_is_open) {
+                           bool *out_is_open,
+                           char *err_buf,
+                           size_t err_cap) {
+    if (err_buf && err_cap > 0U) {
+        err_buf[0] = '\0';
+    }
     const size_t ssid_len = strlen(ssid_arg);
     if (ssid_len == 0U || ssid_len > 32U) {
+        set_err(err_buf, err_cap, "Invalid SSID length");
         fprintf(stderr, "error: invalid SSID length\n");
         return 1;
     }
 
     aic_wifi_status_t st;
     if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
+        set_err(err_buf, err_cap, "LMAC firmware not ready");
         fprintf(stderr, "error: LMAC not ready\n");
         return 1;
     }
 
     printf("[1/4] Scanning for \"%s\"...\n", ssid_arg);
     aic_wifi_scan_list_t list;
-    if (run_scan_and_wait(conn, (const uint8_t *)ssid_arg, (uint8_t)ssid_len, &list) != 0) {
+    if (run_scan_and_wait(conn, (const uint8_t *)ssid_arg, (uint8_t)ssid_len, &list, err_buf, err_cap) != 0) {
         return 1;
     }
 
@@ -322,6 +365,7 @@ static int perform_connect(io_connect_t conn,
         }
     }
     if (!target) {
+        set_err(err_buf, err_cap, "Network \"%s\" not found", ssid_arg);
         fprintf(stderr, "error: AP \"%s\" not found in %u scan results\n", ssid_arg, list.count);
         return 1;
     }
@@ -337,6 +381,7 @@ static int perform_connect(io_connect_t conn,
     const bool has_wpa2 = (target->sec_mask & AIC_SEC_WPA2_PSK) != 0U;
 
     if (!is_open && !has_wpa2) {
+        set_err(err_buf, err_cap, "Unsupported security: %s (needs OPEN or WPA2-PSK)", sec_str);
         fprintf(stderr, "error: security mode '%s' is not supported (requires OPEN or WPA2-PSK/Mixed)\n",
                 sec_str);
         return 1;
@@ -347,11 +392,13 @@ static int perform_connect(io_connect_t conn,
     size_t rsn_ie_len = 0U;
     if (!is_open) {
         if (!passphrase || strlen(passphrase) < 8U) {
+            set_err(err_buf, err_cap, "Passphrase required (8..63 chars) for %s", sec_str);
             fprintf(stderr, "error: valid 8..63 char passphrase required for %s\n", sec_str);
             return 1;
         }
         if (aic_wpa2_derive_pmk(passphrase, strlen(passphrase),
                                 target->ssid, target->ssid_len, pmk) != 0) {
+            set_err(err_buf, err_cap, "PBKDF2 passphrase derivation failed");
             fprintf(stderr, "error: PBKDF2 passphrase derivation failed\n");
             return 1;
         }
@@ -378,6 +425,7 @@ static int perform_connect(io_connect_t conn,
 
     kern_return_t kr = uc_connect(conn, &creq, &cresp);
     if (kr != KERN_SUCCESS || cresp.out_status != 0U) {
+        set_err(err_buf, err_cap, "SM_CONNECT_REQ failed (status=%u)", cresp.out_status);
         fprintf(stderr, "error: SM_CONNECT_REQ failed kr=0x%08x fw_status=%u\n", kr, cresp.out_status);
         return 1;
     }
@@ -391,12 +439,14 @@ static int perform_connect(io_connect_t conn,
                 break;
             }
             if (st.assoc_status != 0xFFFFU && st.assoc_status != 0U) {
+                set_err(err_buf, err_cap, "Association rejected (status=%u)", st.assoc_status);
                 fprintf(stderr, "error: association rejected status_code=%u\n", st.assoc_status);
                 return 1;
             }
         }
     }
     if (!assoc_ok) {
+        set_err(err_buf, err_cap, "Timed out waiting for association");
         fprintf(stderr, "error: timed out waiting for SM_CONNECT_IND\n");
         return 1;
     }
@@ -429,6 +479,7 @@ static int perform_connect(io_connect_t conn,
                                                          &keys_ready,
                                                          &gtk_rekey);
                 if (hrc < 0) {
+                    set_err(err_buf, err_cap, "EAPOL MIC/handshake mismatch (check password)");
                     fprintf(stderr, "error: EAPOL handshake/MIC failure\n");
                     (void)uc_disconnect(conn, 3U);
                     return 1;
@@ -436,6 +487,7 @@ static int perform_connect(io_connect_t conn,
                 if (hrc == 1 && reply_len > 0U) {
                     kr = uc_send_eapol(conn, reply_eth, reply_len);
                     if (kr != KERN_SUCCESS) {
+                        set_err(err_buf, err_cap, "SEND_EAPOL failed: 0x%08x", kr);
                         fprintf(stderr, "error: SEND_EAPOL failed: 0x%08x\n", kr);
                         return 1;
                     }
@@ -444,6 +496,7 @@ static int perform_connect(io_connect_t conn,
                     uint8_t hw_idx = 0U;
                     kr = uc_add_key(conn, 0U, true, wpa_ctx->pairwise_cipher, &wpa_ctx->ptk[32], 16U, &hw_idx);
                     if (kr != KERN_SUCCESS) {
+                        set_err(err_buf, err_cap, "Install PTK failed: 0x%08x", kr);
                         fprintf(stderr, "error: install PTK failed: 0x%08x\n", kr);
                         return 1;
                     }
@@ -452,6 +505,7 @@ static int perform_connect(io_connect_t conn,
                         kr = uc_add_key(conn, wpa_ctx->gtk_idx, false, wpa_ctx->group_cipher,
                                         wpa_ctx->gtk, wpa_ctx->gtk_len, &hw_idx);
                         if (kr != KERN_SUCCESS) {
+                            set_err(err_buf, err_cap, "Install GTK failed: 0x%08x", kr);
                             fprintf(stderr, "error: install GTK failed: 0x%08x\n", kr);
                             return 1;
                         }
@@ -465,6 +519,7 @@ static int perform_connect(io_connect_t conn,
         }
 
         if (!keys_installed) {
+            set_err(err_buf, err_cap, "4-Way Handshake timed out (wrong password?)");
             fprintf(stderr, "error: timed out waiting for 4-way handshake\n");
             (void)uc_disconnect(conn, 3U);
             return 1;
@@ -478,6 +533,7 @@ static int perform_connect(io_connect_t conn,
     printf("[4/4] Opening LMAC control port & raising link on %s...\n", bsd);
     kr = uc_set_port_link(conn, true, true);
     if (kr != KERN_SUCCESS) {
+        set_err(err_buf, err_cap, "SET_PORT_LINK failed: 0x%08x", kr);
         fprintf(stderr, "error: SET_PORT_LINK failed: 0x%08x\n", kr);
         return 1;
     }
@@ -552,13 +608,543 @@ static bool load_profile(char *ssid_out, size_t ssid_cap, char *pass_out, size_t
     return (ssid_out[0] != '\0');
 }
 
-static void run_rekey_loop(io_connect_t conn, aic_wpa2_ctx_t *wpa_ctx, bool is_open) {
+/* ---------- Daemon IPC State & Helpers ---------- */
+
+typedef enum {
+    CMD_NONE = 0,
+    CMD_SCAN,
+    CMD_CONNECT,
+    CMD_DISCONNECT,
+    CMD_FORGET,
+    CMD_RECONNECT
+} aic_daemon_cmd_kind_t;
+
+typedef struct {
+    aic_daemon_cmd_kind_t kind;
+    char                  ssid[36];
+    char                  pass[72];
+    bool                  has_pass;
+    bool                  save_profile;
+    bool                  done;
+    char                  json_reply[AIC_IPC_BUF_SIZE];
+} aic_daemon_pending_cmd_t;
+
+static pthread_mutex_t g_state_lock     = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_req_lock       = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_req_wait_lock  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_req_done_cond  = PTHREAD_COND_INITIALIZER;
+
+static int             g_wake_pipe[2]   = { -1, -1 };
+static gid_t           g_admin_gid      = 80U;
+static int             g_ctrl_listen_fd = -1;
+
+static aic_wifi_status_t g_snap_status;
+static char              g_snap_bsd[32]        = "unknown";
+static bool              g_snap_present        = false;
+static bool              g_snap_connecting     = false;
+static bool              g_snap_auto_paused    = false;
+static char              g_snap_saved_ssid[36] = "";
+static char              g_snap_last_error[160]= "";
+
+static bool              g_has_active_target   = false;
+static char              g_active_ssid[36]     = "";
+static char              g_active_pass[72]     = "";
+static bool              g_active_has_pass     = false;
+
+static aic_daemon_pending_cmd_t g_pending_cmd;
+
+static void wake_daemon_loop(void) {
+    if (g_wake_pipe[1] >= 0) {
+        const char b = 1;
+        (void)write(g_wake_pipe[1], &b, 1);
+    }
+}
+
+static void drain_wake_pipe(void) {
+    if (g_wake_pipe[0] < 0) {
+        return;
+    }
+    char buf[64];
+    while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) {
+    }
+}
+
+static bool sleep_with_wake_ms(int timeout_ms) {
+    if (g_wake_pipe[0] < 0) {
+        usleep((useconds_t)timeout_ms * 1000U);
+        return false;
+    }
+    struct pollfd pfd;
+    pfd.fd      = g_wake_pipe[0];
+    pfd.events  = POLLIN;
+    pfd.revents = 0;
+    const int rc = poll(&pfd, 1, timeout_ms);
+    if (rc > 0 && (pfd.revents & POLLIN)) {
+        return true;
+    }
+    return false;
+}
+
+static void sync_saved_ssid_snapshot(void) {
+    char ssid[36] = {0};
+    char pass[72] = {0};
+    bool has_p = false;
+    const bool ok = load_profile(ssid, sizeof(ssid), pass, sizeof(pass), &has_p);
+    memset(pass, 0, sizeof(pass));
+
+    pthread_mutex_lock(&g_state_lock);
+    if (ok) {
+        snprintf(g_snap_saved_ssid, sizeof(g_snap_saved_ssid), "%s", ssid);
+    } else {
+        g_snap_saved_ssid[0] = '\0';
+    }
+    pthread_mutex_unlock(&g_state_lock);
+}
+
+static void refresh_snapshot(io_connect_t conn, io_service_t svc) {
+    aic_wifi_status_t st;
+    memset(&st, 0, sizeof(st));
+    char bsd[32] = "unknown";
+    bool present = false;
+
+    if (conn != IO_OBJECT_NULL && svc != IO_OBJECT_NULL && uc_get_status(conn, &st) == KERN_SUCCESS) {
+        present = true;
+        get_bsd_name(svc, bsd, sizeof(bsd));
+    }
+
+    pthread_mutex_lock(&g_state_lock);
+    g_snap_present = present;
+    if (present) {
+        g_snap_status = st;
+        snprintf(g_snap_bsd, sizeof(g_snap_bsd), "%s", bsd);
+    } else {
+        memset(&g_snap_status, 0, sizeof(g_snap_status));
+        snprintf(g_snap_bsd, sizeof(g_snap_bsd), "unknown");
+    }
+    pthread_mutex_unlock(&g_state_lock);
+}
+
+typedef struct {
+    char  *buf;
+    size_t cap;
+    size_t len;
+} str_builder_t;
+
+static void sb_appendf(str_builder_t *sb, const char *fmt, ...) {
+    if (!sb || !sb->buf || sb->len >= sb->cap) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(sb->buf + sb->len, sb->cap - sb->len, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        const size_t add = (size_t)n;
+        sb->len = (sb->len + add < sb->cap) ? (sb->len + add) : (sb->cap - 1U);
+    }
+}
+
+static void sb_append_json_str(str_builder_t *sb, const char *s) {
+    sb_appendf(sb, "\"");
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
+            const unsigned char c = *p;
+            if (c == '"' || c == '\\') {
+                sb_appendf(sb, "\\%c", (char)c);
+            } else if (c == '\n') {
+                sb_appendf(sb, "\\n");
+            } else if (c == '\r') {
+                sb_appendf(sb, "\\r");
+            } else if (c == '\t') {
+                sb_appendf(sb, "\\t");
+            } else if (c < 0x20U) {
+                sb_appendf(sb, "\\u%04x", (unsigned int)c);
+            } else {
+                sb_appendf(sb, "%c", (char)c);
+            }
+        }
+    }
+    sb_appendf(sb, "\"");
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static int hex_decode_str(const char *hex, char *out, size_t out_cap) {
+    if (!hex || !out || out_cap == 0U) {
+        return -1;
+    }
+    const size_t hlen = strlen(hex);
+    if ((hlen % 2U) != 0U || (hlen / 2U) >= out_cap) {
+        return -1;
+    }
+    for (size_t i = 0U; i < hlen; i += 2U) {
+        const int hi = hex_nibble(hex[i]);
+        const int lo = hex_nibble(hex[i + 1U]);
+        if (hi < 0 || lo < 0) {
+            return -1;
+        }
+        const unsigned char b = (unsigned char)((hi << 4) | lo);
+        if (b == '\0') {
+            return -1;
+        }
+        out[i / 2U] = (char)b;
+    }
+    out[hlen / 2U] = '\0';
+    return 0;
+}
+
+static void build_status_json(char *out, size_t cap) {
+    aic_wifi_status_t st;
+    char bsd[32];
+    bool present;
+    bool connecting;
+    bool auto_paused;
+    char saved_ssid[36];
+    char last_error[160];
+
+    pthread_mutex_lock(&g_state_lock);
+    st          = g_snap_status;
+    present     = g_snap_present;
+    connecting  = g_snap_connecting;
+    auto_paused = g_snap_auto_paused;
+    snprintf(bsd, sizeof(bsd), "%s", g_snap_bsd);
+    snprintf(saved_ssid, sizeof(saved_ssid), "%s", g_snap_saved_ssid);
+    snprintf(last_error, sizeof(last_error), "%s", g_snap_last_error);
+    pthread_mutex_unlock(&g_state_lock);
+
+    char ssid_str[33] = {0};
+    if (st.ssid_len > 0U && st.ssid_len <= 32U) {
+        memcpy(ssid_str, st.ssid, st.ssid_len);
+    }
+    char mac_str[20];
+    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+             st.mac_addr[0], st.mac_addr[1], st.mac_addr[2],
+             st.mac_addr[3], st.mac_addr[4], st.mac_addr[5]);
+    char bssid_str[20];
+    snprintf(bssid_str, sizeof(bssid_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+             st.ap_bssid[0], st.ap_bssid[1], st.ap_bssid[2],
+             st.ap_bssid[3], st.ap_bssid[4], st.ap_bssid[5]);
+
+    str_builder_t sb = { out, cap, 0U };
+    sb_appendf(&sb, "{\"ok\":true,\"present\":%s", present ? "true" : "false");
+    sb_appendf(&sb, ",\"bsd\":");       sb_append_json_str(&sb, bsd);
+    sb_appendf(&sb, ",\"mac\":");       sb_append_json_str(&sb, mac_str);
+    sb_appendf(&sb, ",\"fw\":");        sb_append_json_str(&sb, (const char *)st.fw_version);
+    sb_appendf(&sb, ",\"chip_id\":\"0x%08x\",\"lmac_version\":\"0x%08x\"", st.chip_id, st.lmac_version);
+    sb_appendf(&sb, ",\"is_5g\":%s,\"lmac_ready\":%s,\"associated\":%s,\"link_up\":%s",
+               st.is_5g_supported ? "true" : "false",
+               st.lmac_ready ? "true" : "false",
+               st.associated ? "true" : "false",
+               st.link_up ? "true" : "false");
+    sb_appendf(&sb, ",\"assoc_status\":%u,\"disc_reason\":%u", st.assoc_status, st.disconnect_reason);
+    sb_appendf(&sb, ",\"ssid\":");      sb_append_json_str(&sb, ssid_str);
+    sb_appendf(&sb, ",\"bssid\":");     sb_append_json_str(&sb, bssid_str);
+    sb_appendf(&sb, ",\"freq\":%u,\"sta_idx\":%u", st.ap_center_freq, st.ap_sta_idx);
+    sb_appendf(&sb, ",\"tx_packets\":%llu,\"rx_packets\":%llu,\"eapol_rx_total\":%llu,\"eapol_rx_queued\":%u",
+               st.tx_packets, st.rx_packets, st.eapol_rx_total, st.eapol_rx_queued);
+    sb_appendf(&sb, ",\"connecting\":%s,\"auto_paused\":%s",
+               connecting ? "true" : "false",
+               auto_paused ? "true" : "false");
+    sb_appendf(&sb, ",\"saved_ssid\":"); sb_append_json_str(&sb, saved_ssid);
+    sb_appendf(&sb, ",\"last_error\":"); sb_append_json_str(&sb, last_error);
+    sb_appendf(&sb, "}\n");
+}
+
+static void build_scan_json(const aic_wifi_scan_list_t *list, char *out, size_t cap) {
+    str_builder_t sb = { out, cap, 0U };
+    sb_appendf(&sb, "{\"ok\":true,\"scan_done\":%s,\"bss\":[", list->scan_done ? "true" : "false");
+    for (uint16_t i = 0U; i < list->count; ++i) {
+        const aic_wifi_scan_bss_t *b = &list->bss[i];
+        char ssid_str[33] = {0};
+        const bool hidden = (b->ssid_len == 0U || b->ssid_len > 32U);
+        if (!hidden) {
+            memcpy(ssid_str, b->ssid, b->ssid_len);
+        }
+        char bssid_str[20];
+        snprintf(bssid_str, sizeof(bssid_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 b->bssid[0], b->bssid[1], b->bssid[2], b->bssid[3], b->bssid[4], b->bssid[5]);
+        char sec_str[20];
+        format_sec_str(b->sec_mask, sec_str, sizeof(sec_str));
+        const bool is_open = (b->sec_mask & (AIC_SEC_PRIVACY | AIC_SEC_WPA_PSK | AIC_SEC_WPA2_PSK | AIC_SEC_WPA3_SAE | AIC_SEC_8021X)) == 0U;
+
+        sb_appendf(&sb, "%s{\"ssid\":", (i > 0U) ? "," : "");
+        sb_append_json_str(&sb, hidden ? "" : ssid_str);
+        sb_appendf(&sb, ",\"hidden\":%s,\"bssid\":", hidden ? "true" : "false");
+        sb_append_json_str(&sb, bssid_str);
+        sb_appendf(&sb, ",\"freq\":%u,\"rssi\":%d,\"sec\":", b->freq, (int)b->rssi);
+        sb_append_json_str(&sb, sec_str);
+        sb_appendf(&sb, ",\"open\":%s}", is_open ? "true" : "false");
+    }
+    sb_appendf(&sb, "]}\n");
+}
+
+static void build_err_json(const char *msg, char *out, size_t cap) {
+    str_builder_t sb = { out, cap, 0U };
+    sb_appendf(&sb, "{\"ok\":false,\"error\":");
+    sb_append_json_str(&sb, msg ? msg : "unknown error");
+    sb_appendf(&sb, "}\n");
+}
+
+static void execute_pending_scan(io_connect_t conn) {
+    if (conn == IO_OBJECT_NULL) {
+        build_err_json("Adapter not connected", g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
+        return;
+    }
+    aic_wifi_scan_list_t list;
+    char err[160] = {0};
+    if (run_scan_and_wait(conn, NULL, 0U, &list, err, sizeof(err)) != 0) {
+        build_err_json(err[0] ? err : "Scan failed", g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
+        return;
+    }
+    build_scan_json(&list, g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply));
+}
+
+static bool dispatch_daemon_cmd_sync(const aic_daemon_pending_cmd_t *req, char *reply_out, size_t reply_cap) {
+    pthread_mutex_lock(&g_req_lock);
+
+    pthread_mutex_lock(&g_req_wait_lock);
+    memset(&g_pending_cmd, 0, sizeof(g_pending_cmd));
+    g_pending_cmd = *req;
+    g_pending_cmd.done = false;
+    wake_daemon_loop();
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 25;
+    int wrc = 0;
+    while (!g_pending_cmd.done && g_keep_running && wrc == 0) {
+        wrc = pthread_cond_timedwait(&g_req_done_cond, &g_req_wait_lock, &ts);
+    }
+    if (g_pending_cmd.done) {
+        snprintf(reply_out, reply_cap, "%s", g_pending_cmd.json_reply);
+    } else {
+        build_err_json("Daemon request timed out", reply_out, reply_cap);
+    }
+    const bool ok = g_pending_cmd.done;
+    g_pending_cmd.kind = CMD_NONE;
+    pthread_mutex_unlock(&g_req_wait_lock);
+
+    pthread_mutex_unlock(&g_req_lock);
+    return ok;
+}
+
+static void finish_pending_cmd_locked(const char *json_msg) {
+    pthread_mutex_lock(&g_req_wait_lock);
+    if (json_msg) {
+        snprintf(g_pending_cmd.json_reply, sizeof(g_pending_cmd.json_reply), "%s", json_msg);
+    }
+    g_pending_cmd.done = true;
+    pthread_cond_signal(&g_req_done_cond);
+    pthread_mutex_unlock(&g_req_wait_lock);
+}
+
+static bool peer_is_authorized(int cfd) {
+    struct xucred uc;
+    socklen_t len = sizeof(uc);
+    memset(&uc, 0, sizeof(uc));
+    if (getsockopt(cfd, SOL_LOCAL, LOCAL_PEERCRED, &uc, &len) != 0 || uc.cr_version != XUCRED_VERSION) {
+        return false;
+    }
+    if (uc.cr_uid == 0U) {
+        return true;
+    }
+    const short ngroups = (uc.cr_ngroups > NGROUPS) ? NGROUPS : uc.cr_ngroups;
+    for (short i = 0; i < ngroups; ++i) {
+        if (uc.cr_groups[i] == g_admin_gid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void handle_ipc_client(int cfd) {
+    if (!peer_is_authorized(cfd)) {
+        const char *deny = "{\"ok\":false,\"error\":\"Unauthorized peer\"}\n";
+        (void)write(cfd, deny, strlen(deny));
+        return;
+    }
+
+    char req_line[512];
+    size_t used = 0U;
+    while (used + 1U < sizeof(req_line)) {
+        const ssize_t n = read(cfd, req_line + used, sizeof(req_line) - 1U - used);
+        if (n <= 0) {
+            break;
+        }
+        used += (size_t)n;
+        req_line[used] = '\0';
+        if (strchr(req_line, '\n') != NULL) {
+            break;
+        }
+    }
+    while (used > 0U && (req_line[used - 1U] == '\n' || req_line[used - 1U] == '\r')) {
+        req_line[--used] = '\0';
+    }
+
+    char reply[AIC_IPC_BUF_SIZE];
+    if (strcmp(req_line, "STATUS") == 0) {
+        build_status_json(reply, sizeof(reply));
+    } else if (strcmp(req_line, "SCAN") == 0) {
+        aic_daemon_pending_cmd_t req;
+        memset(&req, 0, sizeof(req));
+        req.kind = CMD_SCAN;
+        (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+    } else if (strcmp(req_line, "DISCONNECT") == 0) {
+        aic_daemon_pending_cmd_t req;
+        memset(&req, 0, sizeof(req));
+        req.kind = CMD_DISCONNECT;
+        (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+    } else if (strcmp(req_line, "FORGET") == 0) {
+        aic_daemon_pending_cmd_t req;
+        memset(&req, 0, sizeof(req));
+        req.kind = CMD_FORGET;
+        (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+    } else if (strcmp(req_line, "RECONNECT") == 0) {
+        aic_daemon_pending_cmd_t req;
+        memset(&req, 0, sizeof(req));
+        req.kind = CMD_RECONNECT;
+        (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+    } else if (strncmp(req_line, "CONNECT_HEX ", 12U) == 0) {
+        char *p = req_line + 12U;
+        char *sp1 = strchr(p, ' ');
+        char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+        if (!sp1 || !sp2) {
+            build_err_json("Malformed CONNECT_HEX syntax", reply, sizeof(reply));
+        } else {
+            *sp1 = '\0';
+            *sp2 = '\0';
+            const char *ssid_hex = p;
+            const char *pass_hex = sp1 + 1;
+            const int save_flag  = atoi(sp2 + 1);
+
+            aic_daemon_pending_cmd_t req;
+            memset(&req, 0, sizeof(req));
+            req.kind         = CMD_CONNECT;
+            req.save_profile = (save_flag != 0);
+            if (hex_decode_str(ssid_hex, req.ssid, sizeof(req.ssid)) != 0 || req.ssid[0] == '\0') {
+                build_err_json("Invalid SSID", reply, sizeof(reply));
+            } else if (strcmp(pass_hex, "-") != 0) {
+                if (hex_decode_str(pass_hex, req.pass, sizeof(req.pass)) != 0 ||
+                    strlen(req.pass) < 8U || strlen(req.pass) > 63U) {
+                    build_err_json("Passphrase must be 8..63 chars", reply, sizeof(reply));
+                } else {
+                    req.has_pass = true;
+                    (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+                }
+            } else {
+                req.has_pass = false;
+                (void)dispatch_daemon_cmd_sync(&req, reply, sizeof(reply));
+            }
+            memset(req.pass, 0, sizeof(req.pass));
+        }
+    } else {
+        build_err_json("Unknown command", reply, sizeof(reply));
+    }
+
+    const size_t rlen = strlen(reply);
+    size_t sent = 0U;
+    while (sent < rlen) {
+        const ssize_t w = write(cfd, reply + sent, rlen - sent);
+        if (w <= 0) {
+            break;
+        }
+        sent += (size_t)w;
+    }
+}
+
+static void *control_socket_thread(void *arg) {
+    (void)arg;
+    while (g_keep_running && g_ctrl_listen_fd >= 0) {
+        struct pollfd pfd;
+        pfd.fd      = g_ctrl_listen_fd;
+        pfd.events  = POLLIN;
+        pfd.revents = 0;
+        const int prc = poll(&pfd, 1, 500);
+        if (prc <= 0) {
+            continue;
+        }
+        if (pfd.revents & POLLIN) {
+            const int cfd = accept(g_ctrl_listen_fd, NULL, NULL);
+            if (cfd >= 0) {
+                handle_ipc_client(cfd);
+                close(cfd);
+            }
+        }
+    }
+    return NULL;
+}
+
+static int setup_control_socket(void) {
+    const struct group *grp = getgrnam("admin");
+    g_admin_gid = grp ? grp->gr_gid : 20U;
+
+    (void)unlink(AIC_WIFI_SOCK_PATH);
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "warning: control socket() failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", AIC_WIFI_SOCK_PATH);
+
+    if (bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "warning: bind(%s) failed: %s\n", AIC_WIFI_SOCK_PATH, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    (void)chown(AIC_WIFI_SOCK_PATH, 0, g_admin_gid);
+    (void)chmod(AIC_WIFI_SOCK_PATH, 0660);
+
+    if (listen(fd, 8) != 0) {
+        fprintf(stderr, "warning: listen(%s) failed: %s\n", AIC_WIFI_SOCK_PATH, strerror(errno));
+        close(fd);
+        (void)unlink(AIC_WIFI_SOCK_PATH);
+        return -1;
+    }
+    return fd;
+}
+
+/* Returns true if broken out due to a pending control command instead of disconnect. */
+static bool run_rekey_loop(io_connect_t conn,
+                           io_service_t svc,
+                           aic_wpa2_ctx_t *wpa_ctx,
+                           bool is_open,
+                           bool daemon_mode) {
     while (g_keep_running) {
+        if (daemon_mode && sleep_with_wake_ms(250)) {
+            drain_wake_pipe();
+            aic_daemon_cmd_kind_t k = CMD_NONE;
+            pthread_mutex_lock(&g_req_wait_lock);
+            k = g_pending_cmd.done ? CMD_NONE : g_pending_cmd.kind;
+            pthread_mutex_unlock(&g_req_wait_lock);
+
+            if (k == CMD_SCAN) {
+                execute_pending_scan(conn);
+                finish_pending_cmd_locked(NULL);
+                continue;
+            }
+            if (k == CMD_CONNECT || k == CMD_DISCONNECT || k == CMD_FORGET || k == CMD_RECONNECT) {
+                return true;
+            }
+        }
+
         aic_wifi_status_t st;
         if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready || !st.associated) {
             fprintf(stderr, "notice: Wi-Fi link lost/disconnected (reason=%u)\n", st.disconnect_reason);
             break;
         }
+        if (daemon_mode) {
+            refresh_snapshot(conn, svc);
+        }
+
         if (!is_open) {
             aic_wifi_eapol_frame_t rx_frame;
             if (uc_poll_eapol(conn, &rx_frame) == KERN_SUCCESS && rx_frame.has_frame) {
@@ -583,62 +1169,332 @@ static void run_rekey_loop(io_connect_t conn, aic_wpa2_ctx_t *wpa_ctx, bool is_o
                 }
             }
         }
-        usleep(250000);
+
+        if (!daemon_mode) {
+            usleep(250000);
+        }
     }
+    return false;
+}
+
+static bool handle_daemon_pending_command(io_connect_t conn,
+                                          io_service_t svc,
+                                          aic_wpa2_ctx_t *wpa_ctx,
+                                          bool *is_open_out,
+                                          bool *connected_now) {
+    aic_daemon_pending_cmd_t local;
+    pthread_mutex_lock(&g_req_wait_lock);
+    if (g_pending_cmd.done || g_pending_cmd.kind == CMD_NONE) {
+        pthread_mutex_unlock(&g_req_wait_lock);
+        return false;
+    }
+    local = g_pending_cmd;
+    pthread_mutex_unlock(&g_req_wait_lock);
+
+    char reply[AIC_IPC_BUF_SIZE];
+    if (local.kind == CMD_SCAN) {
+        if (conn == IO_OBJECT_NULL) {
+            build_err_json("Adapter not connected", reply, sizeof(reply));
+        } else {
+            aic_wifi_scan_list_t list;
+            char err[160] = {0};
+            if (run_scan_and_wait(conn, NULL, 0U, &list, err, sizeof(err)) != 0) {
+                build_err_json(err[0] ? err : "Scan failed", reply, sizeof(reply));
+            } else {
+                build_scan_json(&list, reply, sizeof(reply));
+            }
+        }
+        finish_pending_cmd_locked(reply);
+    } else if (local.kind == CMD_DISCONNECT) {
+        pthread_mutex_lock(&g_state_lock);
+        g_snap_auto_paused = true;
+        g_snap_last_error[0] = '\0';
+        pthread_mutex_unlock(&g_state_lock);
+        g_has_active_target = false;
+        memset(g_active_pass, 0, sizeof(g_active_pass));
+
+        if (conn != IO_OBJECT_NULL) {
+            (void)uc_disconnect(conn, 3U);
+            refresh_snapshot(conn, svc);
+        }
+        *connected_now = false;
+        finish_pending_cmd_locked("{\"ok\":true}\n");
+    } else if (local.kind == CMD_FORGET) {
+        (void)unlink(AIC_WIFI_CONF_PATH);
+        sync_saved_ssid_snapshot();
+        g_has_active_target = false;
+        memset(g_active_pass, 0, sizeof(g_active_pass));
+
+        pthread_mutex_lock(&g_state_lock);
+        g_snap_auto_paused = false;
+        g_snap_last_error[0] = '\0';
+        pthread_mutex_unlock(&g_state_lock);
+
+        if (conn != IO_OBJECT_NULL) {
+            (void)uc_disconnect(conn, 3U);
+            refresh_snapshot(conn, svc);
+        }
+        *connected_now = false;
+        finish_pending_cmd_locked("{\"ok\":true}\n");
+    } else if (local.kind == CMD_RECONNECT) {
+        pthread_mutex_lock(&g_state_lock);
+        g_snap_auto_paused = false;
+        g_snap_last_error[0] = '\0';
+        pthread_mutex_unlock(&g_state_lock);
+        finish_pending_cmd_locked("{\"ok\":true}\n");
+    } else if (local.kind == CMD_CONNECT) {
+        if (local.save_profile) {
+            (void)save_profile(local.ssid, local.has_pass ? local.pass : NULL);
+            sync_saved_ssid_snapshot();
+        }
+        snprintf(g_active_ssid, sizeof(g_active_ssid), "%s", local.ssid);
+        if (local.has_pass) {
+            snprintf(g_active_pass, sizeof(g_active_pass), "%s", local.pass);
+        } else {
+            g_active_pass[0] = '\0';
+        }
+        g_active_has_pass   = local.has_pass;
+        g_has_active_target = true;
+
+        if (conn == IO_OBJECT_NULL) {
+            build_err_json("Adapter not connected", reply, sizeof(reply));
+            finish_pending_cmd_locked(reply);
+            return true;
+        }
+
+        aic_wifi_status_t st;
+        if (uc_get_status(conn, &st) == KERN_SUCCESS && st.associated) {
+            (void)uc_disconnect(conn, 3U);
+            usleep(150000);
+        }
+
+        pthread_mutex_lock(&g_state_lock);
+        g_snap_auto_paused   = false;
+        g_snap_connecting    = true;
+        g_snap_last_error[0] = '\0';
+        pthread_mutex_unlock(&g_state_lock);
+
+        char err[160] = {0};
+        const int rc = perform_connect(conn,
+                                       svc,
+                                       local.ssid,
+                                       local.has_pass ? local.pass : NULL,
+                                       true,
+                                       wpa_ctx,
+                                       is_open_out,
+                                       err,
+                                       sizeof(err));
+        refresh_snapshot(conn, svc);
+
+        pthread_mutex_lock(&g_state_lock);
+        g_snap_connecting = false;
+        if (rc != 0) {
+            snprintf(g_snap_last_error, sizeof(g_snap_last_error), "%s", err[0] ? err : "Connection failed");
+        } else {
+            g_snap_last_error[0] = '\0';
+        }
+        pthread_mutex_unlock(&g_state_lock);
+
+        if (rc == 0) {
+            *connected_now = true;
+            finish_pending_cmd_locked("{\"ok\":true}\n");
+        } else {
+            build_err_json(err[0] ? err : "Connection failed", reply, sizeof(reply));
+            finish_pending_cmd_locked(reply);
+        }
+    }
+    return true;
 }
 
 static int run_daemon(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_sigterm);
     signal(SIGTERM, on_sigterm);
 
-    printf("aic8800_wifi daemon starting (profile=%s)\n", AIC_WIFI_CONF_PATH);
+    if (pipe(g_wake_pipe) == 0) {
+        (void)fcntl(g_wake_pipe[0], F_SETFL, O_NONBLOCK);
+        (void)fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
+    }
+
+    g_ctrl_listen_fd = setup_control_socket();
+    pthread_t ctrl_thread;
+    bool ctrl_thread_started = false;
+    if (g_ctrl_listen_fd >= 0 && pthread_create(&ctrl_thread, NULL, control_socket_thread, NULL) == 0) {
+        ctrl_thread_started = true;
+    }
+
+    sync_saved_ssid_snapshot();
+    printf("aic8800_wifi daemon starting (profile=%s, sock=%s)\n", AIC_WIFI_CONF_PATH, AIC_WIFI_SOCK_PATH);
 
     while (g_keep_running) {
-        char ssid[36] = {0};
-        char pass[72] = {0};
-        bool has_pass = false;
-        if (!load_profile(ssid, sizeof(ssid), pass, sizeof(pass), &has_pass)) {
-            sleep(3);
-            continue;
-        }
+        sync_saved_ssid_snapshot();
 
         io_connect_t conn = IO_OBJECT_NULL;
         io_service_t svc  = IO_OBJECT_NULL;
-        if (open_wifi_client(&conn, &svc, true) != 0) {
-            sleep(2);
+        if (open_wifi_client(&conn, &svc, true, NULL) != 0) {
+            refresh_snapshot(IO_OBJECT_NULL, IO_OBJECT_NULL);
+            aic_wpa2_ctx_t dummy_ctx;
+            bool dummy_open = false;
+            bool dummy_conn = false;
+            if (sleep_with_wake_ms(1500)) {
+                drain_wake_pipe();
+                (void)handle_daemon_pending_command(IO_OBJECT_NULL, IO_OBJECT_NULL, &dummy_ctx, &dummy_open, &dummy_conn);
+            }
             continue;
         }
 
+        refresh_snapshot(conn, svc);
         aic_wifi_status_t st;
         if (uc_get_status(conn, &st) != KERN_SUCCESS || !st.lmac_ready) {
             IOServiceClose(conn);
             IOObjectRelease(svc);
-            sleep(1);
+            if (sleep_with_wake_ms(800)) {
+                drain_wake_pipe();
+                aic_wpa2_ctx_t dummy_ctx;
+                bool dummy_open = false;
+                bool dummy_conn = false;
+                (void)handle_daemon_pending_command(IO_OBJECT_NULL, IO_OBJECT_NULL, &dummy_ctx, &dummy_open, &dummy_conn);
+            }
             continue;
         }
 
-        if (!st.associated || !st.link_up) {
-            aic_wpa2_ctx_t wpa_ctx;
-            bool is_open = false;
-            if (perform_connect(conn, svc, ssid, has_pass ? pass : NULL, true, &wpa_ctx, &is_open) == 0) {
-                run_rekey_loop(conn, &wpa_ctx, is_open);
+        /* Process any queued socket command before auto-connect */
+        aic_wpa2_ctx_t wpa_ctx;
+        bool is_open = false;
+        bool connected_now = false;
+        drain_wake_pipe();
+        if (handle_daemon_pending_command(conn, svc, &wpa_ctx, &is_open, &connected_now)) {
+            if (connected_now) {
+                (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, true);
+            }
+            IOServiceClose(conn);
+            IOObjectRelease(svc);
+            continue;
+        }
+
+        bool auto_paused = false;
+        pthread_mutex_lock(&g_state_lock);
+        auto_paused = g_snap_auto_paused;
+        pthread_mutex_unlock(&g_state_lock);
+
+        char target_ssid[36] = {0};
+        char target_pass[72] = {0};
+        bool target_has_pass = false;
+        bool have_target = false;
+
+        if (!auto_paused) {
+            if (g_has_active_target && g_active_ssid[0] != '\0') {
+                snprintf(target_ssid, sizeof(target_ssid), "%s", g_active_ssid);
+                if (g_active_has_pass) {
+                    snprintf(target_pass, sizeof(target_pass), "%s", g_active_pass);
+                }
+                target_has_pass = g_active_has_pass;
+                have_target = true;
             } else {
-                sleep(3);
+                have_target = load_profile(target_ssid, sizeof(target_ssid),
+                                           target_pass, sizeof(target_pass), &target_has_pass);
+            }
+        }
+
+        if (!auto_paused && have_target && (!st.associated || !st.link_up)) {
+            pthread_mutex_lock(&g_state_lock);
+            g_snap_connecting = true;
+            pthread_mutex_unlock(&g_state_lock);
+
+            char err[160] = {0};
+            const int rc = perform_connect(conn,
+                                           svc,
+                                           target_ssid,
+                                           target_has_pass ? target_pass : NULL,
+                                           true,
+                                           &wpa_ctx,
+                                           &is_open,
+                                           err,
+                                           sizeof(err));
+            memset(target_pass, 0, sizeof(target_pass));
+            refresh_snapshot(conn, svc);
+
+            pthread_mutex_lock(&g_state_lock);
+            g_snap_connecting = false;
+            if (rc != 0 && err[0] != '\0') {
+                snprintf(g_snap_last_error, sizeof(g_snap_last_error), "%s", err);
+            } else if (rc == 0) {
+                g_snap_last_error[0] = '\0';
+            }
+            pthread_mutex_unlock(&g_state_lock);
+
+            if (rc == 0) {
+                (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, true);
+            } else if (sleep_with_wake_ms(3000)) {
+                drain_wake_pipe();
+                (void)handle_daemon_pending_command(conn, svc, &wpa_ctx, &is_open, &connected_now);
+                if (connected_now) {
+                    (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, true);
+                }
             }
         } else {
-            sleep(2);
+            memset(target_pass, 0, sizeof(target_pass));
+            if (sleep_with_wake_ms(1000)) {
+                drain_wake_pipe();
+                (void)handle_daemon_pending_command(conn, svc, &wpa_ctx, &is_open, &connected_now);
+                if (connected_now) {
+                    (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, true);
+                }
+            }
         }
 
         IOServiceClose(conn);
         IOObjectRelease(svc);
-        if (g_keep_running) {
-            sleep(1);
-        }
     }
+
+    if (ctrl_thread_started) {
+        pthread_join(ctrl_thread, NULL);
+    }
+    if (g_ctrl_listen_fd >= 0) {
+        close(g_ctrl_listen_fd);
+        (void)unlink(AIC_WIFI_SOCK_PATH);
+    }
+    if (g_wake_pipe[0] >= 0) close(g_wake_pipe[0]);
+    if (g_wake_pipe[1] >= 0) close(g_wake_pipe[1]);
     printf("aic8800_wifi daemon stopping.\n");
     return 0;
+}
+
+/* ---------- Non-root IPC query helper for CLI ---------- */
+static int query_daemon_socket(const char *cmd_line, char *out, size_t out_cap) {
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", AIC_WIFI_SOCK_PATH);
+    if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    const size_t clen = strlen(cmd_line);
+    if (write(fd, cmd_line, clen) != (ssize_t)clen || write(fd, "\n", 1) != 1) {
+        close(fd);
+        return -1;
+    }
+    size_t used = 0U;
+    while (used + 1U < out_cap) {
+        const ssize_t n = read(fd, out + used, out_cap - 1U - used);
+        if (n <= 0) {
+            break;
+        }
+        used += (size_t)n;
+        if (memchr(out, '\n', used) != NULL) {
+            break;
+        }
+    }
+    out[used] = '\0';
+    close(fd);
+    return (used > 0U) ? 0 : -1;
 }
 
 static void print_usage(const char *prog) {
@@ -669,7 +1525,15 @@ int main(int argc, char **argv) {
 
     io_connect_t conn = IO_OBJECT_NULL;
     io_service_t svc  = IO_OBJECT_NULL;
-    if (open_wifi_client(&conn, &svc, false) != 0) {
+    kern_return_t open_kr = KERN_FAILURE;
+    if (open_wifi_client(&conn, &svc, false, &open_kr) != 0) {
+        if (open_kr == kIOReturnNotPrivileged && strcmp(argv[1], "status") == 0) {
+            char json[AIC_IPC_BUF_SIZE];
+            if (query_daemon_socket("STATUS", json, sizeof(json)) == 0) {
+                printf("%s", json);
+                return 0;
+            }
+        }
         return 1;
     }
 
@@ -694,12 +1558,12 @@ int main(int argc, char **argv) {
         }
         aic_wpa2_ctx_t wpa_ctx;
         bool is_open = false;
-        rc = perform_connect(conn, svc, ssid, pass, run_dhcp, &wpa_ctx, &is_open);
+        rc = perform_connect(conn, svc, ssid, pass, run_dhcp, &wpa_ctx, &is_open, NULL, 0U);
         if (rc == 0 && stay) {
             signal(SIGINT, on_sigterm);
             signal(SIGTERM, on_sigterm);
             printf("Supplicant staying resident for GTK rekeying (Ctrl+C to exit)...\n");
-            run_rekey_loop(conn, &wpa_ctx, is_open);
+            (void)run_rekey_loop(conn, svc, &wpa_ctx, is_open, false);
         }
     } else if (strcmp(argv[1], "disconnect") == 0) {
         const kern_return_t kr = uc_disconnect(conn, 3U);

@@ -6,6 +6,9 @@ FW_DIR        ?= /Users/rush/.gemini/antigravity/brain/3af3af06-ee65-4085-960c-f
 CC  := xcrun clang
 CXX := xcrun clang++
 
+SWIFTC := xcrun swiftc
+SWIFT_TARGET := x86_64-apple-macosx15.0
+
 BUILD_DIR := build
 OBJ_DIR   := $(BUILD_DIR)/obj
 
@@ -32,6 +35,7 @@ WIFI_KEXT := $(BUILD_DIR)/AIC8800WiFi.kext
 BT_KEXT   := $(BUILD_DIR)/AIC8800BTQuirk.kext
 FWLOAD    := $(BUILD_DIR)/aic8800_fwload
 WIFI_CLI  := $(BUILD_DIR)/aic8800_wifi
+MENU_APP  := $(BUILD_DIR)/AIC8800Menu.app
 
 TEST_ABI    := $(BUILD_DIR)/test_abi_parity
 TEST_PHASE0 := $(BUILD_DIR)/test_phase0
@@ -45,7 +49,8 @@ all: $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker \
      $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi \
      $(BT_KEXT)/Contents/MacOS/AIC8800BTQuirk \
      $(FWLOAD) \
-     $(WIFI_CLI)
+     $(WIFI_CLI) \
+     $(MENU_APP)/Contents/MacOS/AIC8800Menu
 
 $(OBJ_DIR)/msc $(OBJ_DIR)/wifi $(OBJ_DIR)/bt $(BUILD_DIR):
 	@mkdir -p $@
@@ -105,6 +110,14 @@ $(FWLOAD): daemon/aic8800_fwload/main.c common/aic8800_abi.h common/aic8800_fram
 $(WIFI_CLI): tools/aic8800_wifi.c common/aic8800_abi.h common/aic8800_framing.h common/aic8800_wifi_ctl.h common/aic8800_wpa2.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Wno-deprecated-declarations -Icommon $< -o $@ -framework IOKit -framework CoreFoundation
 
+# 4b. Lightweight HeliPort-Style Menu Bar App (talks to daemon via /var/run/aic8800_wifi.sock)
+$(MENU_APP)/Contents/MacOS/AIC8800Menu: apps/AIC8800Menu/main.swift apps/AIC8800Menu/Info.plist | $(BUILD_DIR)
+	@mkdir -p $(MENU_APP)/Contents/MacOS
+	cp apps/AIC8800Menu/Info.plist $(MENU_APP)/Contents/Info.plist
+	plutil -lint $(MENU_APP)/Contents/Info.plist
+	$(SWIFTC) -swift-version 5 -O -parse-as-library -target $(SWIFT_TARGET) -sdk $(SDKROOT) -framework Cocoa $< -o $@
+	codesign --force --sign - $(MENU_APP)
+
 # 5. Phase 0 Verification Tests
 $(TEST_ABI): tests/test_abi_parity.c common/aic8800_abi.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
@@ -155,19 +168,20 @@ test: all $(TEST_ABI) $(TEST_PHASE0) $(TEST_PHASE1) $(TEST_PHASE2) $(TEST_PHASE3
 	./$(TEST_NOHEAP)
 	@echo "--- Running ASan + UBSan fwload daemon control-plane suite ---"
 	./$(TEST_DAEMON)
-	@echo "--- Validating LaunchDaemon plists & CLI help ---"
+	@echo "--- Validating LaunchDaemon plists, Menu Bar app & CLI help ---"
 	plutil -lint daemon/com.rush.aic8800_fwload.plist
 	plutil -lint daemon/com.rush.aic8800_wifi.plist
+	plutil -lint apps/AIC8800Menu/Info.plist
 	./$(WIFI_CLI) --help >/dev/null
 	@echo "--- Running aic8800_fwload --help & --dry-run (Stage 1 5 GHz patch validation) ---"
 	./$(FWLOAD) --help >/dev/null
 	./$(FWLOAD) --fw-dir "$(FW_DIR)" --dry-run
 	@echo "--- Inspecting Mach-O types & kext KPI purity ---"
-	file $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi $(BT_KEXT)/Contents/MacOS/AIC8800BTQuirk $(FWLOAD) $(WIFI_CLI)
+	file $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi $(BT_KEXT)/Contents/MacOS/AIC8800BTQuirk $(FWLOAD) $(WIFI_CLI) $(MENU_APP)/Contents/MacOS/AIC8800Menu
 	@echo "Checking AIC8800MSCBlocker & AIC8800WiFi undefined symbols for private/Lilu leakage:"
 	@if nm -u $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi | grep -E "Lilu|lilu|KernelPatcher|Apple80211|IOMallocPage"; then exit 1; else echo "OK: AIC8800MSCBlocker & AIC8800WiFi pure public KPI"; fi
 
-install-daemon: $(FWLOAD)
+install-daemon: $(FWLOAD) $(WIFI_CLI) $(MENU_APP)/Contents/MacOS/AIC8800Menu
 	sudo FW_DIR="$(FW_DIR)" ./scripts/install_daemon.sh
 
 uninstall-daemon:

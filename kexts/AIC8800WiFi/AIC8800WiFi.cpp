@@ -10,6 +10,7 @@
 #include <libkern/OSAtomic.h>
 #include <libkern/OSByteOrder.h>
 #include <libkern/libkern.h>
+#include <net/kpi_interface.h>
 #include <sys/kpi_mbuf.h>
 
 OSDefineMetaClassAndStructors(AIC8800WiFi, IOEthernetController)
@@ -554,16 +555,33 @@ void AIC8800WiFi::handleMsgRxBuffer(const uint8_t *buf, uint32_t bytesTransferre
     }
 }
 
+static inline void recordIfnetRxStat(IONetworkInterface *netIf,
+                                     uint32_t pkts,
+                                     uint32_t bytes,
+                                     uint32_t errs) {
+    if (!netIf || (pkts == 0U && bytes == 0U && errs == 0U)) {
+        return;
+    }
+    ifnet_t ifp = netIf->getIfnet();
+    if (ifp) {
+        (void)ifnet_stat_increment_in(ifp, pkts, bytes, errs);
+    }
+}
+
 void AIC8800WiFi::reordDeliverFn(void *headPkt, uint32_t totalBytes, void *ctx) {
     (void)totalBytes;
     AIC8800WiFi *self = static_cast<AIC8800WiFi *>(ctx);
     mbuf_t cur = static_cast<mbuf_t>(headPkt);
+    uint32_t deliveredPkts = 0U;
+    uint32_t deliveredBytes = 0U;
     while (cur != nullptr) {
         mbuf_t next = mbuf_nextpkt(cur);
         mbuf_setnextpkt(cur, nullptr);
         if (self && self->netIf_ && self->isEnabled_ && self->linkUp_ && !self->stopping_) {
             const UInt32 pktLen = static_cast<UInt32>(mbuf_pkthdr_len(cur));
             (void)self->netIf_->inputPacket(cur, pktLen, 0U, nullptr);
+            deliveredPkts++;
+            deliveredBytes += static_cast<uint32_t>(pktLen);
             if (self->netStats_) {
                 OSIncrementAtomic(&self->netStats_->inputPackets);
             }
@@ -571,6 +589,9 @@ void AIC8800WiFi::reordDeliverFn(void *headPkt, uint32_t totalBytes, void *ctx) 
             self->freePacket(cur);
         }
         cur = next;
+    }
+    if (self && deliveredPkts > 0U) {
+        recordIfnetRxStat(self->netIf_, deliveredPkts, deliveredBytes, 0U);
     }
 }
 
@@ -643,6 +664,7 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
                 if (self->netStats_) {
                     OSIncrementAtomic(&self->netStats_->inputErrors);
                 }
+                recordIfnetRxStat(self->netIf_, 0U, 0U, 1U);
                 return;
             }
 
@@ -651,6 +673,7 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
                 if (self->netStats_) {
                     OSIncrementAtomic(&self->netStats_->inputErrors);
                 }
+                recordIfnetRxStat(self->netIf_, 0U, 0U, 1U);
                 return;
             }
             mbuf_setnextpkt(pkt, nullptr);
@@ -699,8 +722,11 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
                                                       &DataRxHelper::onEthFrame,
                                                       rxCtx);
             IOLockUnlock(self->rxDeliverLock_);
-            if (rc < 0 && self->netStats_) {
-                OSIncrementAtomic(&self->netStats_->inputErrors);
+            if (rc < 0) {
+                if (self->netStats_) {
+                    OSIncrementAtomic(&self->netStats_->inputErrors);
+                }
+                recordIfnetRxStat(self->netIf_, 0U, 0U, 1U);
             }
         }
 
