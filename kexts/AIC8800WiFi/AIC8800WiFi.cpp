@@ -1,4 +1,5 @@
 #include "AIC8800WiFi.hpp"
+#include "AIC8800WiFiUserClient.hpp"
 
 #include <pexpert/pexpert.h>
 #include <IOKit/IOLib.h>
@@ -37,6 +38,13 @@ bool AIC8800WiFi::init(OSDictionary *properties) {
 }
 
 void AIC8800WiFi::free() {
+    if (linkSyncTimer_) {
+        linkSyncTimer_->cancelTimeout();
+        if (workLoop_) {
+            workLoop_->removeEventSource(linkSyncTimer_);
+        }
+        OSSafeReleaseNULL(linkSyncTimer_);
+    }
     releasePools();
     releaseLocks();
     releasePipes();
@@ -146,13 +154,16 @@ bool AIC8800WiFi::allocatePools() {
     if (!cmdWaitLock_) {
         cmdWaitLock_ = IOLockAlloc();
     }
+    if (!stateLock_) {
+        stateLock_ = IOLockAlloc();
+    }
     if (!rxDeliverLock_) {
         rxDeliverLock_ = IOLockAlloc();
     }
     if (!txLock_) {
         txLock_ = IOSimpleLockAlloc();
     }
-    if (!cmdSerializeLock_ || !cmdWaitLock_ || !rxDeliverLock_ || !txLock_) {
+    if (!cmdSerializeLock_ || !cmdWaitLock_ || !stateLock_ || !rxDeliverLock_ || !txLock_) {
         releasePools();
         return false;
     }
@@ -253,6 +264,10 @@ void AIC8800WiFi::releaseLocks() {
         IOLockFree(rxDeliverLock_);
         rxDeliverLock_ = nullptr;
     }
+    if (stateLock_) {
+        IOLockFree(stateLock_);
+        stateLock_ = nullptr;
+    }
     if (cmdWaitLock_) {
         IOLockFree(cmdWaitLock_);
         cmdWaitLock_ = nullptr;
@@ -339,6 +354,154 @@ void AIC8800WiFi::stopAndDrainIo() {
     }
 }
 
+void AIC8800WiFi::onAsyncLmacCallback(uint16_t msgId, const uint8_t *param, uint16_t paramLen, void *ctx) {
+    AIC8800WiFi *self = static_cast<AIC8800WiFi *>(ctx);
+    if (self && !self->stopping_ && !self->isInactive()) {
+        self->handleAsyncLmacEvent(msgId, param, paramLen);
+    }
+}
+
+void AIC8800WiFi::enqueueEapolRx(const uint8_t *ethFrame, size_t ethLen) {
+    if (!stateLock_ || !ethFrame || ethLen < 14U || ethLen > AIC_WIFI_EAPOL_MAX_FRAME) {
+        return;
+    }
+    IOLockLock(stateLock_);
+    if (eapolCount_ < AIC_WIFI_EAPOL_RING_CAP) {
+        aic_wifi_eapol_frame_t *slot = &eapolRxRing_[eapolTail_];
+        slot->len       = static_cast<uint16_t>(ethLen);
+        slot->has_frame = 1U;
+        slot->reserved  = 0U;
+        memcpy(slot->data, ethFrame, ethLen);
+        eapolTail_ = static_cast<uint16_t>((eapolTail_ + 1U) % AIC_WIFI_EAPOL_RING_CAP);
+        eapolCount_++;
+    }
+    eapolRxTotal_++;
+    IOLockUnlock(stateLock_);
+}
+
+void AIC8800WiFi::handleAsyncLmacEvent(uint16_t msgId, const uint8_t *param, uint16_t paramLen) {
+    if (!stateLock_ || stopping_ || isInactive()) {
+        return;
+    }
+
+    if (msgId == AIC_SCANU_RESULT_IND) {
+        aic_wifi_scan_bss_t bss;
+        if (aic_parse_scanu_result_ind(param, paramLen, &bss) != 0) {
+            return;
+        }
+        IOLockLock(stateLock_);
+        int matchIdx = -1;
+        int weakestIdx = 0;
+        for (uint16_t i = 0U; i < scanCount_; ++i) {
+            if (memcmp(scanBss_[i].bssid, bss.bssid, AIC_MAC_ADDR_LEN) == 0) {
+                matchIdx = static_cast<int>(i);
+                break;
+            }
+            if (scanBss_[i].rssi < scanBss_[weakestIdx].rssi) {
+                weakestIdx = static_cast<int>(i);
+            }
+        }
+        if (matchIdx >= 0) {
+            if (bss.ssid_len == 0U && scanBss_[matchIdx].ssid_len > 0U) {
+                bss.ssid_len = scanBss_[matchIdx].ssid_len;
+                memcpy(bss.ssid, scanBss_[matchIdx].ssid, AIC_MAC_SSID_LEN);
+            }
+            if (bss.sec_mask == 0U && scanBss_[matchIdx].sec_mask != 0U) {
+                bss.sec_mask        = scanBss_[matchIdx].sec_mask;
+                bss.pairwise_cipher = scanBss_[matchIdx].pairwise_cipher;
+                bss.group_cipher    = scanBss_[matchIdx].group_cipher;
+                bss.rsn_capab       = scanBss_[matchIdx].rsn_capab;
+            }
+            scanBss_[matchIdx] = bss;
+        } else if (scanCount_ < AIC_WIFI_MAX_SCAN_BSS) {
+            scanBss_[scanCount_] = bss;
+            scanCount_++;
+        } else if (bss.rssi > scanBss_[weakestIdx].rssi) {
+            scanBss_[weakestIdx] = bss;
+        }
+        IOLockUnlock(stateLock_);
+        return;
+    }
+
+    if (msgId == AIC_SCANU_START_CFM) {
+        IOLockLock(stateLock_);
+        scanning_ = false;
+        scanDone_ = true;
+        IOLockUnlock(stateLock_);
+        return;
+    }
+
+    if (msgId == AIC_SM_CONNECT_IND) {
+        if (!param || paramLen < offsetof(aic_sm_connect_ind_t, assoc_ie_buf)) {
+            return;
+        }
+        aic_sm_connect_ind_t ind;
+        memset(&ind, 0, sizeof(ind));
+        const size_t copyLen = (paramLen < sizeof(ind)) ? paramLen : sizeof(ind);
+        memcpy(&ind, param, copyLen);
+
+        bool needLinkDrop = false;
+        IOLockLock(stateLock_);
+        assocStatus_ = ind.status_code;
+        if (ind.status_code == 0U) {
+            associated_   = true;
+            apStaIdx_     = ind.ap_idx;
+            apQos_        = ind.qos;
+            apBand_       = ind.band;
+            apWidth_      = ind.width;
+            apCenterFreq_ = ind.center_freq;
+            disconnectReason_ = 0U;
+            memcpy(apBssid_, ind.bssid.array, AIC_MAC_ADDR_LEN);
+        } else {
+            associated_ = false;
+            if (linkUp_) {
+                linkUp_ = false;
+                needLinkDrop = true;
+            }
+        }
+        IOLockUnlock(stateLock_);
+
+        IOLog("AIC8800WiFi: SM_CONNECT_IND status=%u ap_idx=%u qos=%u freq=%u width=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x\n",
+              ind.status_code, ind.ap_idx, ind.qos, ind.center_freq, ind.width,
+              ind.bssid.array[0] & 0xFFU, (ind.bssid.array[0] >> 8U) & 0xFFU,
+              ind.bssid.array[1] & 0xFFU, (ind.bssid.array[1] >> 8U) & 0xFFU,
+              ind.bssid.array[2] & 0xFFU, (ind.bssid.array[2] >> 8U) & 0xFFU);
+
+        if (needLinkDrop && linkSyncTimer_) {
+            (void)linkSyncTimer_->setTimeoutMS(1U);
+        }
+        return;
+    }
+
+    if (msgId == AIC_SM_DISCONNECT_IND) {
+        if (!param || paramLen < sizeof(aic_sm_disconnect_ind_t)) {
+            return;
+        }
+        aic_sm_disconnect_ind_t ind;
+        memcpy(&ind, param, sizeof(ind));
+
+        bool needLinkDrop = false;
+        IOLockLock(stateLock_);
+        associated_       = false;
+        disconnectReason_ = ind.reason_code;
+        if (linkUp_) {
+            linkUp_ = false;
+            needLinkDrop = true;
+        }
+        eapolHead_  = 0U;
+        eapolTail_  = 0U;
+        eapolCount_ = 0U;
+        IOLockUnlock(stateLock_);
+
+        IOLog("AIC8800WiFi: SM_DISCONNECT_IND reason=%u vif=%u\n",
+              ind.reason_code, ind.vif_idx);
+
+        if (needLinkDrop && linkSyncTimer_) {
+            (void)linkSyncTimer_->setTimeoutMS(1U);
+        }
+    }
+}
+
 void AIC8800WiFi::handleMsgRxBuffer(const uint8_t *buf, uint32_t bytesTransferred) {
     if (!buf || bytesTransferred < 4U || !cmdWaitLock_) {
         return;
@@ -348,7 +511,12 @@ void AIC8800WiFi::handleMsgRxBuffer(const uint8_t *buf, uint32_t bytesTransferre
     memset(&summary, 0, sizeof(summary));
 
     IOLockLock(cmdWaitLock_);
-    (void)aic_usb_dispatch_msg_urb(&cmdMatcher_, buf, bytesTransferred, &summary);
+    (void)aic_usb_dispatch_msg_urb_ex(&cmdMatcher_,
+                                      buf,
+                                      bytesTransferred,
+                                      &AIC8800WiFi::onAsyncLmacCallback,
+                                      this,
+                                      &summary);
     if (summary.matched_cmd_cfm || cmdMatcher_.completed) {
         IOLockWakeup(cmdWaitLock_, &cmdMatcher_, false);
     }
@@ -395,11 +563,18 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
                                size_t eth_len,
                                const aic_rx_frame_meta_t *meta,
                                void *ctx) {
-            (void)meta;
             DataRxCtx *rxCtx = static_cast<DataRxCtx *>(ctx);
             AIC8800WiFi *self = rxCtx ? rxCtx->self : nullptr;
-            if (!self || !self->netIf_ || !self->isEnabled_ || self->stopping_ ||
-                eth_len < 14U || eth_len > kTxSlotBufBytes) {
+            if (!self || self->stopping_ || eth_len < 14U || eth_len > kTxSlotBufBytes) {
+                return;
+            }
+
+            if (meta && meta->is_eapol) {
+                self->enqueueEapolRx(eth_frame, eth_len);
+                return;
+            }
+
+            if (!self->netIf_ || !self->isEnabled_ || !self->linkUp_) {
                 return;
             }
 
@@ -432,7 +607,7 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
         static void onDataChunk(const uint8_t *chunk, size_t chunk_len, void *ctx) {
             DataRxCtx *rxCtx = static_cast<DataRxCtx *>(ctx);
             AIC8800WiFi *self = rxCtx ? rxCtx->self : nullptr;
-            if (!self || !self->netIf_ || !self->isEnabled_ || self->stopping_ || !self->rxDeliverLock_) {
+            if (!self || !self->netIf_ || self->stopping_ || !self->rxDeliverLock_) {
                 return;
             }
 
@@ -458,7 +633,9 @@ void AIC8800WiFi::handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferr
 
             aic_msg_rx_dispatch_t summary;
             memset(&summary, 0, sizeof(summary));
-            summary.matcher = &self->cmdMatcher_;
+            summary.matcher      = &self->cmdMatcher_;
+            summary.on_async_ind = &AIC8800WiFi::onAsyncLmacCallback;
+            summary.async_ctx    = self;
 
             IOLockLock(self->cmdWaitLock_);
             (void)aic_usb_handle_ctrl_pkt(&summary,
@@ -906,13 +1083,15 @@ size_t AIC8800WiFi::encodeEthMbufToSlot(mbuf_t m, uint16_t slotIdx) {
     if (mbuf_copydata(m, 0, totalLen, txScratchFrame_) != 0) {
         return 0U;
     }
+    const uint8_t staIdx = apStaIdx_;
+    const uint8_t tid    = (apQos_ != 0U) ? AIC_STA_DEFAULT_TID : AIC_STA_NONQOS_TID;
     size_t usbLen = 0U;
     if (aic_tx_encode_eth_frame(txScratchFrame_,
                                 totalLen,
-                                0U,
+                                staIdx,
                                 vifIdx_,
-                                0U,
-                                0U,
+                                tid,
+                                AIC_RWNX_HWQ_BE,
                                 0U,
                                 true,
                                 txSlots_[slotIdx].buf,
@@ -1022,11 +1201,18 @@ bool AIC8800WiFi::start(IOService *provider) {
         return false;
     }
 
-    /* Phase 1: keep kIONetworkLinkActive OFF until Phase 3A association */
+    if (!linkSyncTimer_ && workLoop_) {
+        linkSyncTimer_ = IOTimerEventSource::timerEventSource(this, &AIC8800WiFi::onLinkSyncTimer);
+        if (linkSyncTimer_) {
+            (void)workLoop_->addEventSource(linkSyncTimer_);
+        }
+    }
+
+    /* Phase 3A: keep kIONetworkLinkActive OFF until LMAC association + keys ready */
     setLinkStatus(kIONetworkLinkValid);
     netIf_->registerService();
     registerService();
-    IOLog("AIC8800WiFi: started Phase 1 (in=0x%02x msgIn=0x%02x out=0x%02x msgOut=0x%02x mps=%u/%u)\n",
+    IOLog("AIC8800WiFi: started Phase 3A (in=0x%02x msgIn=0x%02x out=0x%02x msgOut=0x%02x mps=%u/%u)\n",
           epInAddr_, epInMsgAddr_, epOutDataAddr_, epOutMsgAddr_,
           maxPacketSizeOut_, maxPacketSizeOutMsg_);
     return true;
@@ -1095,6 +1281,14 @@ void AIC8800WiFi::stop(IOService *provider) {
 
     stopAndDrainIo();
 
+    if (linkSyncTimer_) {
+        linkSyncTimer_->cancelTimeout();
+        if (workLoop_) {
+            workLoop_->removeEventSource(linkSyncTimer_);
+        }
+        OSSafeReleaseNULL(linkSyncTimer_);
+    }
+
     netStats_ = nullptr;
     if (netIf_) {
         detachInterface(netIf_);
@@ -1143,7 +1337,7 @@ IOReturn AIC8800WiFi::enable(IONetworkInterface *netif) {
     if (getOutputQueue()) {
         getOutputQueue()->start();
     }
-    setLinkStatus(kIONetworkLinkValid);
+    applyCurrentLinkStatus();
     return kIOReturnSuccess;
 }
 
@@ -1154,7 +1348,7 @@ IOReturn AIC8800WiFi::disable(IONetworkInterface *netif) {
         getOutputQueue()->stop();
         (void)getOutputQueue()->flush();
     }
-    setLinkStatus(kIONetworkLinkValid);
+    applyCurrentLinkStatus();
     return kIOReturnSuccess;
 }
 
@@ -1172,7 +1366,7 @@ UInt32 AIC8800WiFi::outputPacket(mbuf_t m, void *param) {
         return kIOReturnOutputSuccess;
     }
 
-    if (!isEnabled_ || stopping_ || !bulkOutPipe_ || !txLock_) {
+    if (!isEnabled_ || stopping_ || !bulkOutPipe_ || !txLock_ || !associated_ || !linkUp_) {
         if (netStats_) {
             OSIncrementAtomic(&netStats_->outputErrors);
         }
@@ -1288,4 +1482,527 @@ const OSString *AIC8800WiFi::newVendorString() const {
 
 const OSString *AIC8800WiFi::newModelString() const {
     return OSString::withCString("AIC8800D80 USB Wi-Fi 6");
+}
+
+IOReturn AIC8800WiFi::newUserClient(task_t owningTask,
+                                    void *securityID,
+                                    UInt32 type,
+                                    OSDictionary *properties,
+                                    IOUserClient **handler) {
+    if (!handler || stopping_ || isInactive() || !lmacReady_) {
+        return kIOReturnNotReady;
+    }
+    (void)type;
+    if (IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+        return kIOReturnNotPrivileged;
+    }
+
+    AIC8800WiFiUserClient *uc = OSTypeAlloc(AIC8800WiFiUserClient);
+    if (!uc) {
+        return kIOReturnNoMemory;
+    }
+    if (!uc->initWithTask(owningTask, securityID, type, properties)) {
+        uc->release();
+        return kIOReturnNotPrivileged;
+    }
+    if (!uc->attach(this)) {
+        uc->release();
+        return kIOReturnError;
+    }
+    if (!uc->start(this)) {
+        uc->detach(this);
+        uc->release();
+        return kIOReturnError;
+    }
+    *handler = uc;
+    return kIOReturnSuccess;
+}
+
+void AIC8800WiFi::onLinkSyncTimer(OSObject *owner, IOTimerEventSource *sender) {
+    (void)sender;
+    AIC8800WiFi *self = OSDynamicCast(AIC8800WiFi, owner);
+    if (self && !self->stopping_ && !self->isInactive()) {
+        self->applyCurrentLinkStatus();
+    }
+}
+
+IOReturn AIC8800WiFi::onWorkLoopSyncLink(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3) {
+    (void)arg0;
+    (void)arg1;
+    (void)arg2;
+    (void)arg3;
+    AIC8800WiFi *self = OSDynamicCast(AIC8800WiFi, owner);
+    if (self && !self->stopping_ && !self->isInactive()) {
+        self->applyCurrentLinkStatus();
+    }
+    return kIOReturnSuccess;
+}
+
+void AIC8800WiFi::applyCurrentLinkStatus() {
+    bool up = false;
+    if (stateLock_) {
+        IOLockLock(stateLock_);
+        up = isEnabled_ && associated_ && linkUp_;
+        IOLockUnlock(stateLock_);
+    }
+    if (up) {
+        (void)setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive,
+                            getCurrentMedium(),
+                            600000000ULL);
+    } else {
+        (void)setLinkStatus(kIONetworkLinkValid);
+    }
+}
+
+IOReturn AIC8800WiFi::submitRawEthTx(const uint8_t *ethFrame, size_t ethLen, uint8_t staIdx) {
+    if (!ethFrame || ethLen < 14U || ethLen > AIC_WIFI_EAPOL_MAX_FRAME) {
+        return kIOReturnBadArgument;
+    }
+    if (stopping_ || isInactive() || !bulkOutPipe_ || !txLock_) {
+        return kIOReturnNotReady;
+    }
+
+    auto releaseTxSlot = [this](uint16_t idx) {
+        IOSimpleLockLock(txLock_);
+        txSlots_[idx].pendingUrbs = 0U;
+        (void)aic_slot_pool_release(&txPool_, idx);
+        const bool shouldWake = aic_tx_flow_ctrl_on_release(&txFlowCtrl_,
+                                                            aic_slot_pool_in_flight(&txPool_));
+        IOSimpleLockUnlock(txLock_);
+        if (shouldWake && !stopping_ && getOutputQueue()) {
+            getOutputQueue()->service(IOBasicOutputQueue::kServiceAsync);
+        }
+    };
+
+    uint16_t slotIdx = 0U;
+    IOSimpleLockLock(txLock_);
+    if (!aic_tx_flow_ctrl_can_accept(&txFlowCtrl_, aic_slot_pool_in_flight(&txPool_)) ||
+        aic_slot_pool_acquire(&txPool_, &slotIdx) != 0) {
+        IOSimpleLockUnlock(txLock_);
+        return kIOReturnNoResources;
+    }
+    (void)aic_tx_flow_ctrl_on_acquire(&txFlowCtrl_, aic_slot_pool_in_flight(&txPool_));
+    TxUrbSlot *slot = &txSlots_[slotIdx];
+    IOSimpleLockUnlock(txLock_);
+
+    const uint8_t tid = (apQos_ != 0U) ? AIC_STA_DEFAULT_TID : AIC_STA_NONQOS_TID;
+    size_t encodedLen = 0U;
+    if (aic_tx_encode_eth_frame(ethFrame,
+                                ethLen,
+                                staIdx,
+                                vifIdx_,
+                                tid,
+                                AIC_RWNX_HWQ_BE,
+                                0U,
+                                true,
+                                slot->buf,
+                                kTxSlotBufBytes,
+                                &encodedLen) != 0 ||
+        encodedLen == 0U || encodedLen > kTxSlotBufBytes) {
+        releaseTxSlot(slotIdx);
+        return kIOReturnBadArgument;
+    }
+
+    const bool needsZlp = (zlpDesc_ != nullptr) &&
+                          aic_usb_needs_zlp(static_cast<uint32_t>(encodedLen), maxPacketSizeOut_);
+
+    IOSimpleLockLock(txLock_);
+    slot->bytes       = static_cast<uint32_t>(encodedLen);
+    slot->pendingUrbs = needsZlp ? 2U : 1U;
+    IOSimpleLockUnlock(txLock_);
+
+    OSIncrementAtomic(&inFlightIoCount_);
+    if (stopping_) {
+        OSDecrementAtomic(&inFlightIoCount_);
+        releaseTxSlot(slotIdx);
+        return kIOReturnAborted;
+    }
+
+    const IOReturn ret = bulkOutPipe_->io(slot->desc, static_cast<uint32_t>(encodedLen), &slot->dataComp, 0U);
+    if (ret != kIOReturnSuccess) {
+        OSDecrementAtomic(&inFlightIoCount_);
+        releaseTxSlot(slotIdx);
+        return ret;
+    }
+
+    if (needsZlp) {
+        OSIncrementAtomic(&inFlightIoCount_);
+        const IOReturn zlpRet = bulkOutPipe_->io(zlpDesc_, 0U, &slot->zlpComp, 0U);
+        if (zlpRet != kIOReturnSuccess) {
+            OSDecrementAtomic(&inFlightIoCount_);
+            bool shouldWake = false;
+            IOSimpleLockLock(txLock_);
+            if (slot->pendingUrbs > 0U) {
+                slot->pendingUrbs--;
+            }
+            if (slot->pendingUrbs == 0U) {
+                (void)aic_slot_pool_release(&txPool_, slotIdx);
+                shouldWake = aic_tx_flow_ctrl_on_release(&txFlowCtrl_,
+                                                         aic_slot_pool_in_flight(&txPool_));
+            }
+            IOSimpleLockUnlock(txLock_);
+            if (shouldWake && !stopping_ && getOutputQueue()) {
+                getOutputQueue()->service(IOBasicOutputQueue::kServiceAsync);
+            }
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn AIC8800WiFi::ctlGetStatus(aic_wifi_status_t *outStatus) {
+    if (!outStatus || !stateLock_) {
+        return kIOReturnBadArgument;
+    }
+    memset(outStatus, 0, sizeof(*outStatus));
+    outStatus->version         = AIC_WIFI_CTL_VERSION;
+    outStatus->lmac_ready      = lmacReady_ ? 1U : 0U;
+    outStatus->is_5g_supported = is5gSupported_;
+    outStatus->vif_idx         = vifIdx_;
+    outStatus->chip_id         = chipIdReg_;
+    outStatus->lmac_version    = lmacVer_;
+    outStatus->fw_features     = fwFeatures_;
+    memcpy(outStatus->mac_addr, hwAddr_.bytes, AIC_MAC_ADDR_LEN);
+    memcpy(outStatus->fw_version, fwVersion_, sizeof(outStatus->fw_version));
+
+    if (netStats_) {
+        outStatus->tx_packets = static_cast<uint64_t>(netStats_->outputPackets);
+        outStatus->rx_packets = static_cast<uint64_t>(netStats_->inputPackets);
+    }
+
+    IOLockLock(stateLock_);
+    outStatus->scanning          = scanning_ ? 1U : 0U;
+    outStatus->scan_done         = scanDone_ ? 1U : 0U;
+    outStatus->associated        = associated_ ? 1U : 0U;
+    outStatus->link_up           = linkUp_ ? 1U : 0U;
+    outStatus->ap_sta_idx        = apStaIdx_;
+    outStatus->ap_qos            = apQos_;
+    outStatus->ap_band           = apBand_;
+    outStatus->ap_width          = apWidth_;
+    outStatus->ap_center_freq    = apCenterFreq_;
+    outStatus->assoc_status      = assocStatus_;
+    outStatus->disconnect_reason = disconnectReason_;
+    outStatus->scan_count        = scanCount_;
+    outStatus->eapol_rx_queued   = eapolCount_;
+    outStatus->eapol_rx_total    = eapolRxTotal_;
+    outStatus->ssid_len          = targetSsidLen_;
+    memcpy(outStatus->ap_bssid, apBssid_, AIC_MAC_ADDR_LEN);
+    memcpy(outStatus->ssid, targetSsid_, AIC_MAC_SSID_LEN);
+    IOLockUnlock(stateLock_);
+    return kIOReturnSuccess;
+}
+
+IOReturn AIC8800WiFi::ctlStartScan(const aic_wifi_scan_req_t *req) {
+    if (!req || !lmacReady_ || !stateLock_ || stopping_ || isInactive()) {
+        return kIOReturnNotReady;
+    }
+
+    IOLockLock(stateLock_);
+    scanCount_ = 0U;
+    scanDone_  = false;
+    scanning_  = true;
+    memset(scanBss_, 0, sizeof(scanBss_));
+    IOLockUnlock(stateLock_);
+
+    aic_scanu_start_req_t scanReq;
+    aic_build_scanu_start_req(&scanReq,
+                              vifIdx_,
+                              is5gSupported_ != 0U,
+                              (req->passive == 0U && req->ssid_len > 0U) ? req->ssid : nullptr,
+                              (req->passive == 0U) ? req->ssid_len : 0U,
+                              req->no_cck != 0U);
+    if (req->passive != 0U) {
+        scanReq.ssid_cnt = 0U;
+    }
+
+    uint16_t cfmLen = 0U;
+    const IOReturn ret = sendLmacCmd(AIC_SCANU_START_REQ,
+                                     AIC_TASK_SCANU,
+                                     AIC_DRV_TASK_ID,
+                                     &scanReq,
+                                     sizeof(scanReq),
+                                     AIC_SCANU_START_CFM_ADDTIONAL,
+                                     nullptr,
+                                     0U,
+                                     &cfmLen,
+                                     AIC_CMD_TX_TIMEOUT_MS);
+    if (ret != kIOReturnSuccess) {
+        IOLockLock(stateLock_);
+        scanning_ = false;
+        scanDone_ = false;
+        IOLockUnlock(stateLock_);
+        IOLog("AIC8800WiFi: SCANU_START_REQ failed ret=0x%x\n", ret);
+    }
+    return ret;
+}
+
+IOReturn AIC8800WiFi::ctlGetScanResults(aic_wifi_scan_list_t *outList) {
+    if (!outList || !stateLock_) {
+        return kIOReturnBadArgument;
+    }
+    memset(outList, 0, sizeof(*outList));
+    IOLockLock(stateLock_);
+    outList->count     = (scanCount_ <= AIC_WIFI_MAX_SCAN_BSS) ? scanCount_ : AIC_WIFI_MAX_SCAN_BSS;
+    outList->scanning  = scanning_ ? 1U : 0U;
+    outList->scan_done = scanDone_ ? 1U : 0U;
+    if (outList->count > 0U) {
+        memcpy(outList->bss, scanBss_, static_cast<size_t>(outList->count) * sizeof(aic_wifi_scan_bss_t));
+    }
+    IOLockUnlock(stateLock_);
+    return kIOReturnSuccess;
+}
+
+IOReturn AIC8800WiFi::ctlConnect(const aic_wifi_connect_req_t *inReq, aic_wifi_connect_req_t *outResp) {
+    if (!inReq || !outResp || !lmacReady_ || !stateLock_ || stopping_ || isInactive()) {
+        return kIOReturnNotReady;
+    }
+    if (inReq->ssid_len == 0U || inReq->ssid_len > AIC_MAC_SSID_LEN ||
+        inReq->ie_len > sizeof(aic_sm_connect_req_t::ie_buf)) {
+        return kIOReturnBadArgument;
+    }
+
+    *outResp = *inReq;
+    outResp->out_status = 0xFFU;
+
+    IOLockLock(stateLock_);
+    associated_       = false;
+    linkUp_           = false;
+    assocStatus_      = 0xFFFFU;
+    disconnectReason_ = 0U;
+    eapolHead_        = 0U;
+    eapolTail_        = 0U;
+    eapolCount_       = 0U;
+    targetSsidLen_    = inReq->ssid_len;
+    memset(targetSsid_, 0, sizeof(targetSsid_));
+    memcpy(targetSsid_, inReq->ssid, inReq->ssid_len);
+    memset(apBssid_, 0, sizeof(apBssid_));
+    IOLockUnlock(stateLock_);
+
+    if (workLoop_) {
+        (void)workLoop_->runAction(&AIC8800WiFi::onWorkLoopSyncLink, this);
+    }
+
+    aic_sm_connect_req_t smReq;
+    memset(&smReq, 0, sizeof(smReq));
+    smReq.ssid.length = inReq->ssid_len;
+    memcpy(smReq.ssid.array, inReq->ssid, inReq->ssid_len);
+    memcpy(smReq.bssid.array, inReq->bssid, AIC_MAC_ADDR_LEN);
+    smReq.vif_idx             = vifIdx_;
+    smReq.chan.band           = inReq->band;
+    smReq.chan.freq           = (inReq->freq != 0U) ? inReq->freq : static_cast<uint16_t>(-1);
+    smReq.chan.flags          = 0U;
+    smReq.flags               = inReq->flags;
+    smReq.ctrl_port_ethertype = inReq->ctrl_port_ethertype;
+    smReq.ie_len              = inReq->ie_len;
+    if (inReq->ie_len > 0U) {
+        memcpy(smReq.ie_buf, inReq->ie_buf, inReq->ie_len);
+    }
+    smReq.listen_interval = 10U;
+    smReq.dont_wait_bcmc  = 0U;
+    smReq.auth_type       = inReq->auth_type;
+    smReq.uapsd_queues    = 0U;
+
+    aic_sm_connect_cfm_t smCfm = {};
+    uint16_t cfmLen = 0U;
+    const IOReturn ret = sendLmacCmd(AIC_SM_CONNECT_REQ,
+                                     AIC_TASK_SM,
+                                     AIC_DRV_TASK_ID,
+                                     &smReq,
+                                     sizeof(smReq),
+                                     AIC_SM_CONNECT_CFM,
+                                     &smCfm,
+                                     sizeof(smCfm),
+                                     &cfmLen,
+                                     AIC_CMD_TX_TIMEOUT_MS);
+    if (ret == kIOReturnSuccess) {
+        outResp->out_status = (cfmLen >= sizeof(smCfm)) ? smCfm.status : 0U;
+    } else {
+        IOLog("AIC8800WiFi: SM_CONNECT_REQ failed ret=0x%x\n", ret);
+    }
+    return ret;
+}
+
+IOReturn AIC8800WiFi::ctlDisconnect(const aic_wifi_disconnect_req_t *req) {
+    if (!req || !lmacReady_ || !stateLock_ || stopping_ || isInactive()) {
+        return kIOReturnNotReady;
+    }
+
+    uint8_t oldStaIdx = 0U;
+    bool wasAssoc = false;
+    IOLockLock(stateLock_);
+    wasAssoc    = associated_;
+    oldStaIdx   = apStaIdx_;
+    associated_ = false;
+    linkUp_     = false;
+    eapolHead_  = 0U;
+    eapolTail_  = 0U;
+    eapolCount_ = 0U;
+    IOLockUnlock(stateLock_);
+
+    if (workLoop_) {
+        (void)workLoop_->runAction(&AIC8800WiFi::onWorkLoopSyncLink, this);
+    }
+
+    if (wasAssoc) {
+        aic_me_set_control_port_req_t portReq = { oldStaIdx, 0U };
+        uint16_t portCfmLen = 0U;
+        (void)sendLmacCmd(AIC_ME_SET_CONTROL_PORT_REQ,
+                          AIC_TASK_ME,
+                          AIC_DRV_TASK_ID,
+                          &portReq,
+                          sizeof(portReq),
+                          AIC_ME_SET_CONTROL_PORT_CFM,
+                          nullptr,
+                          0U,
+                          &portCfmLen,
+                          AIC_CMD_TX_TIMEOUT_MS);
+    }
+
+    aic_sm_disconnect_req_t discReq;
+    discReq.reason_code = (req->reason_code != 0U) ? req->reason_code : 3U;
+    discReq.vif_idx     = vifIdx_;
+    uint16_t cfmLen = 0U;
+    return sendLmacCmd(AIC_SM_DISCONNECT_REQ,
+                       AIC_TASK_SM,
+                       AIC_DRV_TASK_ID,
+                       &discReq,
+                       sizeof(discReq),
+                       AIC_SM_DISCONNECT_CFM,
+                       nullptr,
+                       0U,
+                       &cfmLen,
+                       AIC_CMD_TX_TIMEOUT_MS);
+}
+
+IOReturn AIC8800WiFi::ctlPollEapol(aic_wifi_eapol_frame_t *outFrame) {
+    if (!outFrame || !stateLock_) {
+        return kIOReturnBadArgument;
+    }
+    memset(outFrame, 0, sizeof(*outFrame));
+    IOLockLock(stateLock_);
+    if (eapolCount_ > 0U) {
+        *outFrame  = eapolRxRing_[eapolHead_];
+        eapolHead_ = static_cast<uint16_t>((eapolHead_ + 1U) % AIC_WIFI_EAPOL_RING_CAP);
+        eapolCount_--;
+    }
+    IOLockUnlock(stateLock_);
+    return kIOReturnSuccess;
+}
+
+IOReturn AIC8800WiFi::ctlSendEapol(const aic_wifi_eapol_frame_t *inFrame) {
+    if (!inFrame || !stateLock_ || inFrame->len < 14U || inFrame->len > AIC_WIFI_EAPOL_MAX_FRAME) {
+        return kIOReturnBadArgument;
+    }
+    uint8_t staIdx = 0U;
+    bool isAssoc = false;
+    IOLockLock(stateLock_);
+    isAssoc = associated_;
+    staIdx  = apStaIdx_;
+    IOLockUnlock(stateLock_);
+
+    if (!isAssoc) {
+        return kIOReturnNotReady;
+    }
+    return submitRawEthTx(inFrame->data, inFrame->len, staIdx);
+}
+
+IOReturn AIC8800WiFi::ctlAddKey(const aic_wifi_key_req_t *inReq, aic_wifi_key_req_t *outResp) {
+    if (!inReq || !outResp || !lmacReady_ || !stateLock_ || stopping_ || isInactive()) {
+        return kIOReturnNotReady;
+    }
+    if (inReq->key_len > AIC_MAC_SEC_KEY_LEN) {
+        return kIOReturnBadArgument;
+    }
+
+    uint8_t staIdx = 0xFFU;
+    bool isAssoc = false;
+    IOLockLock(stateLock_);
+    isAssoc = associated_;
+    if (inReq->pairwise != 0U) {
+        staIdx = apStaIdx_;
+    }
+    IOLockUnlock(stateLock_);
+
+    if (!isAssoc) {
+        return kIOReturnNotReady;
+    }
+
+    *outResp = *inReq;
+    outResp->out_status     = 0xFFU;
+    outResp->out_hw_key_idx = 0xFFU;
+
+    aic_mm_key_add_req_t keyReq;
+    memset(&keyReq, 0, sizeof(keyReq));
+    keyReq.sta_idx      = staIdx;
+    keyReq.key_idx      = (inReq->pairwise != 0U) ? 0U : inReq->key_idx;
+    keyReq.pairwise     = (inReq->pairwise != 0U) ? 1U : 0U;
+    keyReq.inst_nbr     = vifIdx_;
+    keyReq.cipher_suite = inReq->cipher_suite;
+    keyReq.spp          = 0U;
+    keyReq.key.length   = inReq->key_len;
+    if (inReq->key_len > 0U) {
+        memcpy(keyReq.key.array, inReq->key, inReq->key_len);
+    }
+
+    aic_mm_key_add_cfm_t keyCfm = {};
+    uint16_t cfmLen = 0U;
+    const IOReturn ret = sendLmacCmd(AIC_MM_KEY_ADD_REQ,
+                                     AIC_TASK_MM,
+                                     AIC_DRV_TASK_ID,
+                                     &keyReq,
+                                     sizeof(keyReq),
+                                     AIC_MM_KEY_ADD_CFM,
+                                     &keyCfm,
+                                     sizeof(keyCfm),
+                                     &cfmLen,
+                                     AIC_CMD_TX_TIMEOUT_MS);
+    if (ret == kIOReturnSuccess && cfmLen >= sizeof(keyCfm)) {
+        outResp->out_status     = keyCfm.status;
+        outResp->out_hw_key_idx = keyCfm.hw_key_idx;
+    }
+    return ret;
+}
+
+IOReturn AIC8800WiFi::ctlSetPortAndLink(const aic_wifi_port_req_t *req) {
+    if (!req || !lmacReady_ || !stateLock_ || stopping_ || isInactive()) {
+        return kIOReturnNotReady;
+    }
+
+    uint8_t staIdx = 0U;
+    bool isAssoc = false;
+    IOLockLock(stateLock_);
+    isAssoc = associated_;
+    staIdx  = apStaIdx_;
+    IOLockUnlock(stateLock_);
+
+    if (!isAssoc && (req->control_port_open != 0U || req->link_up != 0U)) {
+        return kIOReturnNotReady;
+    }
+
+    aic_me_set_control_port_req_t portReq = {
+        staIdx,
+        static_cast<uint8_t>((req->control_port_open != 0U) ? 1U : 0U)
+    };
+    uint16_t cfmLen = 0U;
+    const IOReturn ret = sendLmacCmd(AIC_ME_SET_CONTROL_PORT_REQ,
+                                     AIC_TASK_ME,
+                                     AIC_DRV_TASK_ID,
+                                     &portReq,
+                                     sizeof(portReq),
+                                     AIC_ME_SET_CONTROL_PORT_CFM,
+                                     nullptr,
+                                     0U,
+                                     &cfmLen,
+                                     AIC_CMD_TX_TIMEOUT_MS);
+    if (ret != kIOReturnSuccess) {
+        return ret;
+    }
+
+    IOLockLock(stateLock_);
+    linkUp_ = (req->link_up != 0U) && associated_;
+    IOLockUnlock(stateLock_);
+
+    if (workLoop_) {
+        (void)workLoop_->runAction(&AIC8800WiFi::onWorkLoopSyncLink, this);
+    }
+    return kIOReturnSuccess;
 }

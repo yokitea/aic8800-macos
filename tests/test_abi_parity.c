@@ -6,6 +6,7 @@
 #include "ipc_shared.h"
 #include "rwnx_rx.h"
 #include "aic8800_abi.h"
+#include "aic8800_wifi_ctl.h"
 
 #define CHECK_SIZE(linux_t, aic_t) \
     _Static_assert(sizeof(linux_t) == sizeof(aic_t), "sizeof mismatch: " #linux_t " vs " #aic_t)
@@ -236,6 +237,25 @@ CHECK_OFF(struct mm_set_stack_start_cfm, vendor_info, aic_mm_set_stack_start_cfm
 CHECK_SIZE(struct mm_get_fw_version_cfm, aic_mm_get_fw_version_cfm_t);
 CHECK_OFF(struct mm_get_fw_version_cfm, fw_version_len, aic_mm_get_fw_version_cfm_t, fw_version_len);
 CHECK_OFF(struct mm_get_fw_version_cfm, fw_version, aic_mm_get_fw_version_cfm_t, fw_version);
+
+CHECK_CONST(SCANU_START_CFM, AIC_SCANU_START_CFM);
+CHECK_CONST(SCANU_START_CFM_ADDTIONAL, AIC_SCANU_START_CFM_ADDTIONAL);
+CHECK_CONST(SCANU_RESULT_IND, AIC_SCANU_RESULT_IND);
+CHECK_CONST(SM_CONNECT_REQ, AIC_SM_CONNECT_REQ);
+CHECK_CONST(SM_CONNECT_CFM, AIC_SM_CONNECT_CFM);
+CHECK_CONST(SM_CONNECT_IND, AIC_SM_CONNECT_IND);
+CHECK_CONST(SM_DISCONNECT_REQ, AIC_SM_DISCONNECT_REQ);
+CHECK_CONST(SM_DISCONNECT_IND, AIC_SM_DISCONNECT_IND);
+CHECK_CONST(ME_SET_CONTROL_PORT_REQ, AIC_ME_SET_CONTROL_PORT_REQ);
+CHECK_CONST(ME_SET_CONTROL_PORT_CFM, AIC_ME_SET_CONTROL_PORT_CFM);
+
+CHECK_CONST(MAC_CIPHER_WEP40, AIC_CIPHER_WEP40);
+CHECK_CONST(MAC_CIPHER_TKIP, AIC_CIPHER_TKIP);
+CHECK_CONST(MAC_CIPHER_CCMP, AIC_CIPHER_CCMP);
+CHECK_CONST(MAC_CIPHER_WEP104, AIC_CIPHER_WEP104);
+CHECK_CONST(MAC_CIPHER_BIP_CMAC_128, AIC_CIPHER_BIP_CMAC_128);
+CHECK_CONST(MAC_CIPHER_GCMP_128, AIC_CIPHER_GCMP_128);
+CHECK_CONST(MAC_CIPHER_CCMP_256, AIC_CIPHER_CCMP_256);
 
 int main(void) {
     printf("ABI parity verified at compile time: 100%% struct sizeof/offsetof/const identity.\n");

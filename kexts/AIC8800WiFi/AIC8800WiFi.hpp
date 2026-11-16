@@ -2,6 +2,7 @@
 #define AIC8800_WIFI_HPP
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/network/IOEthernetController.h>
 #include <IOKit/network/IOEthernetInterface.h>
@@ -13,10 +14,13 @@
 #include "aic8800_abi.h"
 #include "aic8800_framing.h"
 #include "aic8800_lmac.h"
+#include "aic8800_wifi_ctl.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/network/IOGatedOutputQueue.h>
+
+class IOUserClient;
 
 class AIC8800WiFi : public IOEthernetController {
     OSDeclareDefaultStructors(AIC8800WiFi)
@@ -38,6 +42,12 @@ public:
     bool willTerminate(IOService *provider, IOOptionBits options) override;
     bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) override;
 
+    IOReturn newUserClient(task_t owningTask,
+                           void *securityID,
+                           UInt32 type,
+                           OSDictionary *properties,
+                           IOUserClient **handler) override;
+
     bool createWorkLoop() override;
     IOWorkLoop *getWorkLoop() const override;
 
@@ -51,6 +61,17 @@ public:
 
     const OSString *newVendorString() const override;
     const OSString *newModelString() const override;
+
+    /* Control-plane APIs invoked by privileged AIC8800WiFiUserClient */
+    IOReturn ctlGetStatus(aic_wifi_status_t *outStatus);
+    IOReturn ctlStartScan(const aic_wifi_scan_req_t *req);
+    IOReturn ctlGetScanResults(aic_wifi_scan_list_t *outList);
+    IOReturn ctlConnect(const aic_wifi_connect_req_t *inReq, aic_wifi_connect_req_t *outResp);
+    IOReturn ctlDisconnect(const aic_wifi_disconnect_req_t *req);
+    IOReturn ctlPollEapol(aic_wifi_eapol_frame_t *outFrame);
+    IOReturn ctlSendEapol(const aic_wifi_eapol_frame_t *inFrame);
+    IOReturn ctlAddKey(const aic_wifi_key_req_t *inReq, aic_wifi_key_req_t *outResp);
+    IOReturn ctlSetPortAndLink(const aic_wifi_port_req_t *req);
 
 private:
     static constexpr uint8_t  kWifiInterfaceNumber = 2U;
@@ -104,8 +125,16 @@ private:
     bool bringUpLmac();
 
     size_t encodeEthMbufToSlot(mbuf_t m, uint16_t slotIdx);
+    IOReturn submitRawEthTx(const uint8_t *ethFrame, size_t ethLen, uint8_t staIdx);
     void handleDataRxBuffer(const uint8_t *buf, uint32_t bytesTransferred);
     void handleMsgRxBuffer(const uint8_t *buf, uint32_t bytesTransferred);
+    void handleAsyncLmacEvent(uint16_t msgId, const uint8_t *param, uint16_t paramLen);
+    void enqueueEapolRx(const uint8_t *ethFrame, size_t ethLen);
+    void applyCurrentLinkStatus();
+
+    static void onAsyncLmacCallback(uint16_t msgId, const uint8_t *param, uint16_t paramLen, void *ctx);
+    static void onLinkSyncTimer(OSObject *owner, IOTimerEventSource *sender);
+    static IOReturn onWorkLoopSyncLink(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
 
     static void onRxComplete(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred);
     static void onMsgRxComplete(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred);
@@ -117,13 +146,15 @@ private:
     IOUSBHostPipe      *bulkOutPipe_    = nullptr;
     IOUSBHostPipe      *bulkOutMsgPipe_ = nullptr;
 
-    IOWorkLoop          *workLoop_   = nullptr;
-    IOEthernetInterface *netIf_      = nullptr;
-    IONetworkStats      *netStats_   = nullptr;
-    OSDictionary        *mediumDict_ = nullptr;
+    IOWorkLoop          *workLoop_      = nullptr;
+    IOTimerEventSource  *linkSyncTimer_ = nullptr;
+    IOEthernetInterface *netIf_         = nullptr;
+    IONetworkStats      *netStats_      = nullptr;
+    OSDictionary        *mediumDict_    = nullptr;
 
     IOLock       *cmdSerializeLock_ = nullptr;
     IOLock       *cmdWaitLock_      = nullptr;
+    IOLock       *stateLock_        = nullptr;
     IOSimpleLock *txLock_           = nullptr;
     IOLock       *rxDeliverLock_    = nullptr;
 
@@ -146,6 +177,31 @@ private:
     uint8_t  is5gSupported_ = 0U;
     uint8_t  vifIdx_        = 0U;
     bool     lmacReady_     = false;
+
+    /* Preallocated scan / connection / EAPOL state protected by stateLock_ */
+    bool     scanning_         = false;
+    bool     scanDone_         = false;
+    uint16_t scanCount_        = 0U;
+    aic_wifi_scan_bss_t scanBss_[AIC_WIFI_MAX_SCAN_BSS] = {};
+
+    bool     associated_       = false;
+    bool     linkUp_           = false;
+    uint8_t  apStaIdx_         = 0U;
+    uint8_t  apQos_            = 1U;
+    uint8_t  apBand_           = 0U;
+    uint8_t  apWidth_          = 0U;
+    uint16_t apCenterFreq_     = 0U;
+    uint16_t assocStatus_      = 0U;
+    uint16_t disconnectReason_ = 0U;
+    uint8_t  apBssid_[AIC_MAC_ADDR_LEN] = {};
+    uint8_t  targetSsidLen_    = 0U;
+    uint8_t  targetSsid_[AIC_MAC_SSID_LEN] = {};
+
+    uint16_t eapolHead_        = 0U;
+    uint16_t eapolTail_        = 0U;
+    uint16_t eapolCount_       = 0U;
+    uint64_t eapolRxTotal_     = 0U;
+    aic_wifi_eapol_frame_t eapolRxRing_[AIC_WIFI_EAPOL_RING_CAP] = {};
 
     aic_fixed_slot_pool_t     txPool_                           = {};
     aic_tx_flow_ctrl_t        txFlowCtrl_                       = {};

@@ -31,18 +31,21 @@ MSC_KEXT := $(BUILD_DIR)/AIC8800MSCBlocker.kext
 WIFI_KEXT := $(BUILD_DIR)/AIC8800WiFi.kext
 BT_KEXT   := $(BUILD_DIR)/AIC8800BTQuirk.kext
 FWLOAD    := $(BUILD_DIR)/aic8800_fwload
+WIFI_CLI  := $(BUILD_DIR)/aic8800_wifi
 
 TEST_ABI    := $(BUILD_DIR)/test_abi_parity
 TEST_PHASE0 := $(BUILD_DIR)/test_phase0
 TEST_PHASE1 := $(BUILD_DIR)/test_phase1
 TEST_PHASE2 := $(BUILD_DIR)/test_phase2_bt
+TEST_PHASE3 := $(BUILD_DIR)/test_phase3_wifi
 TEST_NOHEAP := $(BUILD_DIR)/test_hotpath_noheap
 TEST_DAEMON := $(BUILD_DIR)/test_fwload_daemon
 
 all: $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker \
      $(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi \
      $(BT_KEXT)/Contents/MacOS/AIC8800BTQuirk \
-     $(FWLOAD)
+     $(FWLOAD) \
+     $(WIFI_CLI)
 
 $(OBJ_DIR)/msc $(OBJ_DIR)/wifi $(OBJ_DIR)/bt $(BUILD_DIR):
 	@mkdir -p $@
@@ -64,14 +67,17 @@ $(MSC_KEXT)/Contents/MacOS/AIC8800MSCBlocker: $(OBJ_DIR)/msc/kmod_info.o $(OBJ_D
 $(OBJ_DIR)/wifi/kmod_info.o: kexts/AIC8800WiFi/kmod_info.c | $(OBJ_DIR)/wifi
 	$(CC) $(WIFI_CFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/wifi/AIC8800WiFi.o: kexts/AIC8800WiFi/AIC8800WiFi.cpp kexts/AIC8800WiFi/AIC8800WiFi.hpp common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h | $(OBJ_DIR)/wifi
+$(OBJ_DIR)/wifi/AIC8800WiFi.o: kexts/AIC8800WiFi/AIC8800WiFi.cpp kexts/AIC8800WiFi/AIC8800WiFi.hpp kexts/AIC8800WiFi/AIC8800WiFiUserClient.hpp common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h common/aic8800_wifi_ctl.h | $(OBJ_DIR)/wifi
 	$(CXX) $(WIFI_CXXFLAGS) -c $< -o $@
 
-$(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi: $(OBJ_DIR)/wifi/kmod_info.o $(OBJ_DIR)/wifi/AIC8800WiFi.o kexts/AIC8800WiFi/Info.plist
+$(OBJ_DIR)/wifi/AIC8800WiFiUserClient.o: kexts/AIC8800WiFi/AIC8800WiFiUserClient.cpp kexts/AIC8800WiFi/AIC8800WiFiUserClient.hpp kexts/AIC8800WiFi/AIC8800WiFi.hpp common/aic8800_wifi_ctl.h | $(OBJ_DIR)/wifi
+	$(CXX) $(WIFI_CXXFLAGS) -c $< -o $@
+
+$(WIFI_KEXT)/Contents/MacOS/AIC8800WiFi: $(OBJ_DIR)/wifi/kmod_info.o $(OBJ_DIR)/wifi/AIC8800WiFi.o $(OBJ_DIR)/wifi/AIC8800WiFiUserClient.o kexts/AIC8800WiFi/Info.plist
 	@mkdir -p $(WIFI_KEXT)/Contents/MacOS
 	cp kexts/AIC8800WiFi/Info.plist $(WIFI_KEXT)/Contents/Info.plist
 	plutil -lint $(WIFI_KEXT)/Contents/Info.plist
-	$(CXX) $(WIFI_LDFLAGS) $(OBJ_DIR)/wifi/kmod_info.o $(OBJ_DIR)/wifi/AIC8800WiFi.o -o $@
+	$(CXX) $(WIFI_LDFLAGS) $(OBJ_DIR)/wifi/kmod_info.o $(OBJ_DIR)/wifi/AIC8800WiFi.o $(OBJ_DIR)/wifi/AIC8800WiFiUserClient.o -o $@
 
 # 3. Lilu 1.7.2 BT Quirk Plugin Kext Skeleton
 $(OBJ_DIR)/bt/kmod_info.o: kexts/AIC8800BTQuirk/kmod_info.c | $(OBJ_DIR)/bt
@@ -96,6 +102,9 @@ $(BT_KEXT)/Contents/MacOS/AIC8800BTQuirk: $(OBJ_DIR)/bt/kmod_info.o $(OBJ_DIR)/b
 $(FWLOAD): daemon/aic8800_fwload/main.c common/aic8800_abi.h common/aic8800_framing.h common/aic8800_fwload_ctl.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Wno-deprecated-declarations -Icommon $< -o $@ -framework IOKit -framework CoreFoundation -framework DiskArbitration
 
+$(WIFI_CLI): tools/aic8800_wifi.c common/aic8800_abi.h common/aic8800_framing.h common/aic8800_wifi_ctl.h common/aic8800_wpa2.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Wno-deprecated-declarations -Icommon $< -o $@ -framework IOKit -framework CoreFoundation
+
 # 5. Phase 0 Verification Tests
 $(TEST_ABI): tests/test_abi_parity.c common/aic8800_abi.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror \
@@ -119,6 +128,11 @@ $(TEST_PHASE2): tests/test_phase2_bt.cpp common/aic8800_abi.h | $(BUILD_DIR)
 		-Wall -Wextra -Werror -Icommon \
 		$< -o $@
 
+$(TEST_PHASE3): tests/test_phase3_wifi.cpp common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h common/aic8800_wifi_ctl.h common/aic8800_wpa2.h | $(BUILD_DIR)
+	$(CXX) -std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all \
+		-Wall -Wextra -Werror -Wno-deprecated-declarations -Icommon \
+		$< -o $@
+
 $(TEST_NOHEAP): tests/test_hotpath_noheap.c common/aic8800_abi.h common/aic8800_framing.h common/aic8800_lmac.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -Icommon $< -o $@
 
@@ -126,7 +140,7 @@ $(TEST_DAEMON): tests/test_fwload_daemon.c common/aic8800_abi.h common/aic8800_f
 	$(CC) -std=c11 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all \
 		-Wall -Wextra -Werror -Icommon $< -o $@
 
-test: all $(TEST_ABI) $(TEST_PHASE0) $(TEST_PHASE1) $(TEST_PHASE2) $(TEST_NOHEAP) $(TEST_DAEMON)
+test: all $(TEST_ABI) $(TEST_PHASE0) $(TEST_PHASE1) $(TEST_PHASE2) $(TEST_PHASE3) $(TEST_NOHEAP) $(TEST_DAEMON)
 	@echo "--- Running ABI compile-time parity check ---"
 	./$(TEST_ABI)
 	@echo "--- Running ASan + UBSan 10k+ Phase 0 vector suite ---"
@@ -135,6 +149,8 @@ test: all $(TEST_ABI) $(TEST_PHASE0) $(TEST_PHASE1) $(TEST_PHASE2) $(TEST_NOHEAP
 	./$(TEST_PHASE1)
 	@echo "--- Running ASan + UBSan Phase 2 Bluetooth quirk suite ---"
 	./$(TEST_PHASE2)
+	@echo "--- Running ASan + UBSan Phase 3 Wi-Fi crypto & scan suite ---"
+	./$(TEST_PHASE3)
 	@echo "--- Running zero-heap C interpose hot-path trap ---"
 	./$(TEST_NOHEAP)
 	@echo "--- Running ASan + UBSan fwload daemon control-plane suite ---"

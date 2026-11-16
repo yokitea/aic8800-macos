@@ -375,8 +375,7 @@ static inline int aic_lmac_cmd_on_e2a_msg(aic_lmac_cmd_matcher_t *m,
         m->bad_pattern_count++;
     }
 
-    if ((size_t)hdr.param_len > payload_len - sizeof(hdr) ||
-        (size_t)hdr.param_len > sizeof(m->rx_param)) {
+    if ((size_t)hdr.param_len > payload_len - sizeof(hdr)) {
         m->invalid_pkt_count++;
         if (m->waiting && hdr.id == m->expected_cfm_id) {
             m->rx_param_len = 0U;
@@ -388,6 +387,14 @@ static inline int aic_lmac_cmd_on_e2a_msg(aic_lmac_cmd_matcher_t *m,
     }
 
     if (m->waiting && hdr.id == m->expected_cfm_id) {
+        if ((size_t)hdr.param_len > sizeof(m->rx_param)) {
+            m->invalid_pkt_count++;
+            m->rx_param_len = 0U;
+            m->status       = -2;
+            m->completed    = true;
+            m->waiting      = false;
+            return AIC_MSG_RX_INVALID;
+        }
         m->rx_param_len = hdr.param_len;
         if (hdr.param_len > 0U) {
             aic_lmac_copy(m->rx_param, payload + sizeof(hdr), hdr.param_len);
@@ -403,6 +410,11 @@ static inline int aic_lmac_cmd_on_e2a_msg(aic_lmac_cmd_matcher_t *m,
     return AIC_MSG_RX_ASYNC_IND;
 }
 
+typedef void (*aic_lmac_async_cb_t)(uint16_t msg_id,
+                                    const uint8_t *param,
+                                    uint16_t param_len,
+                                    void *ctx);
+
 typedef struct {
     aic_lmac_cmd_matcher_t *matcher;
     aic_usb_data_cfm_t      last_data_cfm;
@@ -411,6 +423,8 @@ typedef struct {
     uint16_t                last_msg_id;
     const uint8_t          *print_ptr;
     uint16_t                print_len;
+    aic_lmac_async_cb_t     on_async_ind;
+    void                   *async_ctx;
 } aic_msg_rx_dispatch_t;
 
 static inline int aic_usb_handle_ctrl_pkt(aic_msg_rx_dispatch_t *d,
@@ -428,6 +442,10 @@ static inline int aic_usb_handle_ctrl_pkt(aic_msg_rx_dispatch_t *d,
         d->last_msg_id = msg_id;
         if (rc == AIC_MSG_RX_MATCHED_CFM) {
             d->matched_cmd_cfm = true;
+        } else if (rc == AIC_MSG_RX_ASYNC_IND && d->on_async_ind != NULL) {
+            aic_ipc_e2a_msg_hdr_t hdr;
+            aic_lmac_copy(&hdr, payload, sizeof(hdr));
+            d->on_async_ind(msg_id, payload + sizeof(hdr), hdr.param_len, d->async_ctx);
         }
         return rc;
     }
@@ -460,10 +478,12 @@ static inline int aic_usb_handle_ctrl_pkt(aic_msg_rx_dispatch_t *d,
  * Parse a raw USB MSG/IN buffer from bulkInMsgPipe_ into CMD_RSP / DATA_CFM / PRINT.
  * Supports single CFG frames and 4-byte-padded multi-packet MSG URBs cleanly.
  */
-static inline int aic_usb_dispatch_msg_urb(aic_lmac_cmd_matcher_t *matcher,
-                                           const uint8_t *urb_buf,
-                                           size_t urb_len,
-                                           aic_msg_rx_dispatch_t *out_summary) {
+static inline int aic_usb_dispatch_msg_urb_ex(aic_lmac_cmd_matcher_t *matcher,
+                                              const uint8_t *urb_buf,
+                                              size_t urb_len,
+                                              aic_lmac_async_cb_t on_async_ind,
+                                              void *async_ctx,
+                                              aic_msg_rx_dispatch_t *out_summary) {
     if (!matcher || !urb_buf || urb_len < 4U) {
         if (matcher) {
             matcher->invalid_pkt_count++;
@@ -473,7 +493,9 @@ static inline int aic_usb_dispatch_msg_urb(aic_lmac_cmd_matcher_t *matcher,
 
     aic_msg_rx_dispatch_t local;
     aic_lmac_zero(&local, sizeof(local));
-    local.matcher = matcher;
+    local.matcher      = matcher;
+    local.on_async_ind = on_async_ind;
+    local.async_ctx    = async_ctx;
 
     size_t off = 0U;
     size_t packets = 0U;
@@ -503,6 +525,13 @@ static inline int aic_usb_dispatch_msg_urb(aic_lmac_cmd_matcher_t *matcher,
         *out_summary = local;
     }
     return (packets > 0U) ? 0 : -1;
+}
+
+static inline int aic_usb_dispatch_msg_urb(aic_lmac_cmd_matcher_t *matcher,
+                                           const uint8_t *urb_buf,
+                                           size_t urb_len,
+                                           aic_msg_rx_dispatch_t *out_summary) {
+    return aic_usb_dispatch_msg_urb_ex(matcher, urb_buf, urb_len, NULL, NULL, out_summary);
 }
 
 /* ==========================================================================
