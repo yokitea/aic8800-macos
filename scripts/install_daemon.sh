@@ -9,8 +9,11 @@ fi
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FW_SRC_DIR="${FW_DIR:-/Users/rush/.gemini/antigravity/brain/3af3af06-ee65-4085-960c-f78f553e3493/scratch/aic8800d80/fw/aic8800D80}"
 BIN_SRC="${REPO_DIR}/build/aic8800_fwload"
+[[ -x "$BIN_SRC" ]] || BIN_SRC="${REPO_DIR}/bin/aic8800_fwload"
 WIFI_SRC="${REPO_DIR}/build/aic8800_wifi"
+[[ -x "$WIFI_SRC" ]] || WIFI_SRC="${REPO_DIR}/bin/aic8800_wifi"
 MENU_SRC="${REPO_DIR}/build/AIC8800Menu.app"
+[[ -d "$MENU_SRC" ]] || MENU_SRC="${REPO_DIR}/apps/AIC8800Menu.app"
 PLIST_SRC="${REPO_DIR}/daemon/com.rush.aic8800_fwload.plist"
 WIFI_PLIST_SRC="${REPO_DIR}/daemon/com.rush.aic8800_wifi.plist"
 
