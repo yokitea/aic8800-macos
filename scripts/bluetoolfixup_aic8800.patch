@@ -1,8 +1,8 @@
 diff --git a/BrcmPatchRAM/BlueToolFixup.cpp b/BrcmPatchRAM/BlueToolFixup.cpp
-index e592e66..f362b86 100644
+index e592e66..230cdf4 100644
 --- a/BrcmPatchRAM/BlueToolFixup.cpp
 +++ b/BrcmPatchRAM/BlueToolFixup.cpp
-@@ -161,6 +161,44 @@ static const uint8_t kBadChipsetCheckPatched15_4[] =
+@@ -161,6 +161,65 @@ static const uint8_t kBadChipsetCheckPatched15_4[] =
      0x90, 0x90
  };
  
@@ -44,10 +44,31 @@ index e592e66..f362b86 100644
 +    0xEB, 0x2C              // jmp short
 +};
 +
++// Workaround for Sequoia bluetoothd LE_Read_Buffer_Size_V2 fatal error (status=628):
++// Controllers advertising BT 5.2+ LE CIS features (>= 0x10 at offset +0x27) without
++// setting LE_Read_Buffer_Size_V2 in HCI_Read_Local_Supported_Commands cause SendHCICmd(0xf4)
++// to return 0x274 (628) synchronously without fallback to V1 (0xa3).
++// NOP out the jae jump so bluetoothd uses standard LE_Read_Buffer_Size V1 (0x2002).
++static const uint8_t kLEBufferSizeV1FallbackOriginal[] =
++{
++    0x41, 0x80, 0x7E, 0x49, 0x01, // cmpb $1, 0x49(%r14)
++    0x75, 0x15,                   // jne
++    0x41, 0x80, 0x7E, 0x27, 0x10, // cmpb $0x10, 0x27(%r14)
++    0x73, 0x1E                    // jae (use V2)
++};
++
++static const uint8_t kLEBufferSizeV1FallbackPatched[] =
++{
++    0x41, 0x80, 0x7E, 0x49, 0x01, // cmpb $1, 0x49(%r14)
++    0x75, 0x15,                   // jne
++    0x41, 0x80, 0x7E, 0x27, 0x10, // cmpb $0x10, 0x27(%r14)
++    0x90, 0x90                    // nop; nop (always use V1)
++};
++
  static bool shouldPatchBoardId = false;
  static bool shouldPatchAddress = false;
  static bool shouldPatchNvramCheck = false;
-@@ -236,6 +274,12 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
+@@ -236,6 +295,15 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                  searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
              if (shouldPatchAddress)
                  searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
@@ -56,6 +77,9 @@ index e592e66..f362b86 100644
 +            }
 +            if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kSkipExternalFailedCheckOriginal, sizeof(kSkipExternalFailedCheckOriginal), kSkipExternalFailedCheckPatched, sizeof(kSkipExternalFailedCheckPatched))) {
 +                SYSLOG(MODULE_SHORT, "Patched external dongle failed check (forced active) in %s!", path);
++            }
++            if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLEBufferSizeV1FallbackOriginal, sizeof(kLEBufferSizeV1FallbackOriginal), kLEBufferSizeV1FallbackPatched, sizeof(kLEBufferSizeV1FallbackPatched))) {
++                SYSLOG(MODULE_SHORT, "Patched LE_Read_Buffer_Size_V2 -> V1 fallback in %s!", path);
 +            }
          }
      }
